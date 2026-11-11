@@ -1,0 +1,35 @@
+name: Import reviewed JobPilot source
+on:
+  push:
+    paths: ['.github/workflows/import-source.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Verify and restore reviewed source
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'b70738be79c4b2f03362aa6e4f9ef40ba7766d0af92fc439b2290df515ce83a0  JobPilot-source-import.zip' | sha256sum --check
+          unzip -o JobPilot-source-import.zip
+          rm JobPilot-source-import.zip
+          git add -A
+          git update-index --force-remove .github/workflows/import-source.yml
+          test "$(git write-tree)" = '8ffd3830a97b9677b7192a5c41bdbac095327dd1'
+          git add .github/workflows/import-source.yml
+      - name: Run project checks
+        run: npm run check
+      - name: Publish verified source
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Import verified JobPilot source'
+          git push origin HEAD:main
