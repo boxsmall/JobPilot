@@ -30,7 +30,7 @@
     DEBUG_EVENT: "BHT_DEBUG_EVENT"
   };
 
-  const BHT_CONTENT_VERSION = "1.7.45";
+  const BHT_CONTENT_VERSION = "1.7.51";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (
     window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION &&
@@ -78,6 +78,10 @@
   })();
   const nativeGreetingReceipts = [];
   const jobNetworkMetadata = new Map();
+  // Shared by preview activity checks and AI JD retrieval for this page.
+  // Only a deliberate page reload resets a platform stop signal.
+  let jobDetailHalt = null;
+  let jobDetailLastRequestAt = 0;
   let latestJobListRequest = null;
   const jobListPagination = { hasMore: null, loading: false };
 
@@ -2716,14 +2720,21 @@ function firstEl(selectors, root = document) {
   }
 
   async function fetchJobActivityDetail(job = {}, deadlineAt = 0) {
-    const securityId = String(job.securityId || '');
-    const lid = String(job.lid || '');
+    if (jobDetailHalt) return { ...jobDetailHalt };
+    const currentMetadata = jobNetworkMetadata.get(String(job.jobId || ''));
+    // Parameters from an earlier scan may belong to a discarded list session.
+    const params = currentMetadata?.securityId && currentMetadata?.lid ? currentMetadata : job;
+    const securityId = String(params.securityId || '');
+    const lid = String(params.lid || '');
     if (!securityId || !lid) return { ok: false, skipped: true, error: 'DETAIL_PARAMS_MISSING' };
+    const waitMs = Math.max(0, 1000 - (Date.now() - jobDetailLastRequestAt));
+    if (waitMs) await sleep(waitMs);
     const remainingMs = deadlineAt ? Math.max(0, deadlineAt - Date.now()) : 1800;
     if (remainingMs < 250) return { ok: false, skipped: true, error: 'ACTIVITY_DEADLINE' };
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), Math.min(1800, remainingMs));
+    jobDetailLastRequestAt = Date.now();
     try {
       const url = new URL('/wapi/zpgeek/job/detail.json', location.origin);
       url.searchParams.set('securityId', securityId);
@@ -2735,23 +2746,27 @@ function firstEl(selectors, root = document) {
         headers: { 'X-Requested-With': 'XMLHttpRequest' }
       });
       if (!response.ok) {
-        return {
+        const failure = {
           ok: false,
           halt: response.status === 429 || response.status === 403,
           error: 'ACTIVITY_HTTP_' + response.status
         };
+        if (failure.halt) jobDetailHalt = failure;
+        return failure;
       }
       const payload = await response.json();
       const code = Number(payload?.code);
       if (code !== 0) {
         // 任意非零响应都立即熔断，不重试，不放大 BOSS 风控。
-        return { ok: false, halt: true, code, error: 'ACTIVITY_API_' + code };
+        jobDetailHalt = { ok: false, halt: true, code, error: 'ACTIVITY_API_' + code };
+        return { ...jobDetailHalt };
       }
       const zpData = payload?.zpData || {};
       const actualJobId = String(zpData?.jobInfo?.encryptId || '');
       const expectedJobId = String(job.jobId || '');
       if (actualJobId && expectedJobId && actualJobId !== expectedJobId) {
-        return { ok: false, halt: true, error: 'ACTIVITY_JOB_MISMATCH' };
+        jobDetailHalt = { ok: false, halt: true, error: 'ACTIVITY_JOB_MISMATCH' };
+        return { ...jobDetailHalt };
       }
       const bossInfo = zpData?.bossInfo || {};
       const bossOnline = bossInfo.bossOnline === true || bossInfo.bossOnline === 1;
@@ -2768,7 +2783,12 @@ function firstEl(selectors, root = document) {
         activeText,
         source: 'activity-prefetch'
       });
-      return { ok: true, ...(metadata || {}), activeText, bossOnline, detailVerified: Boolean(actualJobId && actualJobId === expectedJobId), jd: String(zpData?.jobInfo?.postDescription || '') };
+      const detailVerified = Boolean(actualJobId && actualJobId === expectedJobId);
+      const jd = typeof zpData?.jobInfo?.postDescription === 'string' ? zpData.jobInfo.postDescription.trim() : '';
+      const error = !actualJobId ? 'DETAIL_JOB_ID_MISSING：详情未返回岗位 ID'
+        : !expectedJobId ? 'DETAIL_EXPECTED_ID_MISSING：扫描记录缺少岗位 ID'
+        : !jd ? 'DETAIL_JD_EMPTY：详情未返回职位正文' : undefined;
+      return { ok: true, ...(metadata || {}), activeText, bossOnline, detailVerified, jd, ...(error ? { error } : {}) };
     } catch (error) {
       return {
         ok: false,
@@ -6536,7 +6556,11 @@ async function runOpByType(type, payload = {}) {
       if (existingBoss) return existingBoss;
     }
     switch (type) {
-      case 'BHT_CAREER_JOB_DETAIL': return await fetchJobActivityDetail(payload.job || {}, Date.now() + 1800);
+      case 'BHT_CAREER_RENDERED_DETAIL': {
+        const { readCareerDetailDocument } = await import(chrome.runtime.getURL('shared/career-detail-dom.js'));
+        return { ...readCareerDetailDocument(payload.job || {}, document, location.href), contentVersion: BHT_CONTENT_VERSION };
+      }
+      case 'BHT_CAREER_JOB_DETAIL': return { ...await fetchJobActivityDetail(payload.job || {}, Date.now() + 2800), contentVersion: BHT_CONTENT_VERSION, careerDetailProtocol: 1 };
       case 'BHT_CAREER_HR_CANCEL': (await getCareerChat()).cancel(); return { ok: true };
       case 'BHT_CAREER_HR_LIST': return (await getCareerChat()).list();
       case 'BHT_CAREER_HR_READ': return await (await getCareerChat()).read(payload);
@@ -6546,6 +6570,7 @@ async function runOpByType(type, payload = {}) {
           ok: true,
           page: pageInfo(),
           contentVersion: BHT_CONTENT_VERSION,
+          careerDetailProtocol: 1,
           contentInstanceId: BHT_CONTENT_INSTANCE_ID
         };
       case MSG.DIAGNOSE:
