@@ -2,9 +2,23 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { CAREER_KEY, CAREER_SECRET, normalizeCareer, normalizeScore, classifyReply, dayKey, dailyReport, scoreFingerprint, endpointURL } from '../extension/shared/career-policy.js';
 import { createCareerService } from '../extension/background/career-service.js';
+import { careerTitlesMatch, careerDetailURL } from '../extension/shared/career-detail-dom.js';
 let passed = 0;
 async function test(name, fn) { await fn(); passed++; console.log('PASS ' + name); }
 const rawScore = { dimensions: { skill: {score:80,reason:'技能证据'}, experience:{score:70,reason:'经历证据'},salary:{score:null,reason:'无期望'},growth:{score:null,reason:'无资料'} },reason:'依据简历与岗位',gaps:['缺少某项经验'] };
+await test('legacy scanner IDs accept only the original terminal tilde link', () => {
+  const job={jobId:'legacy-id',href:'https://www.zhipin.com/job_detail/legacy-id~.html?lid=original'};
+  assert.equal(careerDetailURL(job),job.href);
+  assert.equal(careerDetailURL({...job,jobId:'legacy-id~'}),job.href);
+  for(const path of ['other~','legacy-id~~','legacy-id~other']) assert.throws(()=>careerDetailURL({...job,href:'https://www.zhipin.com/job_detail/'+path+'.html'}));
+  assert.throws(()=>careerDetailURL({...job,href:'https://example.com/job_detail/legacy-id~.html'}));
+});
+await test('only verified travel and benefit badges are ignored when comparing detail titles', () => {
+  for(const badge of ['出差','双休','五险一金','包吃住']) assert.equal(careerTitlesMatch('产品经理-'+badge,'产品经理'),true);
+  assert.equal(careerTitlesMatch('产品经理-广告投放方向','产品经理'),false);
+  assert.equal(careerTitlesMatch('产品经理-双休','运营经理'),false);
+  assert.equal(careerTitlesMatch('产品经理（海外）','产品经理(海外)'),true);
+});
 await test('unknown dimensions are excluded instead of receiving invented scores', () => {
   assert.equal(normalizeScore(rawScore).score, 76);
   assert.throws(() => normalizeScore({ ...rawScore, dimensions: {...rawScore.dimensions, skill:{score:1000,reason:'越界'}} }));
@@ -74,6 +88,121 @@ await test('preview scoring rejects low matches and updates selectable rows',asy
   await f.call('SCORE_START');
   for(let i=0;i<100&&(await f.call('STATE')).progress.running;i++)await new Promise(r=>setTimeout(r,5));
   assert.equal(f.task.results[0].decision,'reject');assert.equal(f.task.results[0].selected,false);assert.equal(f.publishes.length,1);
+});
+await test('completion retries only missing or stale scores and preserves unchanged successful rows',async()=>{
+  const f=fixture({resumeText:'真实简历'.repeat(20),resumeConfirmed:true});f.session[CAREER_SECRET]='key';
+  const done=f.task.results[0];done.ai=await f.service.scoreJob(done.job);
+  const original=structuredClone(done);
+  const pending=structuredClone(done);pending.job.jobId='pending';pending.ai={error:'old failure'};pending.aiBaseDecision='pass';pending.decision='reject';
+  f.task.results.push(pending);
+  await f.call('SCORE_START',{retryOnly:true});
+  for(let i=0;i<100&&(await f.call('STATE')).progress.running;i++)await new Promise(r=>setTimeout(r,5));
+  assert.equal(f.calls(),2);assert.deepEqual(done,original);assert.equal(pending.ai.score,76);
+  assert.match((await f.call('STATE')).progress.message,/评分成功 1，未取得评分 0，未处理 0/);
+  assert.match((await f.call('STATE')).progress.message,/原有 1 个有效评分保持不变/);
+  f.local[CAREER_KEY].resumeText+='更新的真实经历';
+  await f.call('SCORE_START',{retryOnly:true});
+  for(let i=0;i<100&&(await f.call('STATE')).progress.running;i++)await new Promise(r=>setTimeout(r,5));
+  assert.equal(f.calls(),4);
+});
+await test('incomplete model output gets one evidence-based repair; invalid repair and HTTP failures never become scores',async()=>{
+  const f=fixture({resumeText:'真实简历'.repeat(20),resumeConfirmed:true});f.session[CAREER_SECRET]='key';
+  const requests=[];
+  globalThis.fetch=async(url,options)=>{requests.push(JSON.parse(options.body));return{ok:true,json:async()=>({choices:[{message:{content:JSON.stringify(requests.length===1?{...rawScore,gaps:undefined}:rawScore)}}]})};};
+  const job={jobId:'repair',jd:'完整岗位职责',jdVerified:true};
+  assert.equal((await f.service.scoreJob(job)).score,76);assert.equal(requests.length,2);
+  assert.equal(requests[0].messages[1].content,requests[1].messages[1].content);
+  let failedCalls=0;
+  globalThis.fetch=async()=>{failedCalls++;return{ok:true,json:async()=>({choices:[{message:{content:'{}'}}]})};};
+  await assert.rejects(()=>f.service.scoreJob({...job,jobId:'bad'}));assert.equal(failedCalls,2);
+  assert.equal(Object.keys(f.local[CAREER_KEY].scores).length,1);
+  failedCalls=0;globalThis.fetch=async()=>{failedCalls++;return{ok:false,status:401};};
+  await assert.rejects(()=>f.service.scoreJob({...job,jobId:'unauthorized'}),/HTTP 401/);assert.equal(failedCalls,1);
+});
+await test('platform halt stops the batch, retains prior scores and reports pending jobs honestly',async()=>{
+  const f=fixture({resumeText:'真实简历'.repeat(20),resumeConfirmed:true});f.session[CAREER_SECRET]='key';
+  f.task.results=Array.from({length:3},(_,i)=>({decision:'pass',selected:true,reasonCodes:[],reasonTexts:[],job:{jobId:'j'+i,jdVerified:false}}));
+  f.task.items=f.task.results.map(r=>({jobId:r.job.jobId,state:'NOT_STARTED',selected:true}));
+  let details=0;
+  f.hooks.detail=async()=>++details===1?{ok:true,detailVerified:true,jd:'已核对的完整职责'}:{ok:false,halt:true,error:'ACTIVITY_API_37'};
+  await f.call('SCORE_START');
+  for(let i=0;i<100&&(await f.call('STATE')).progress.running;i++)await new Promise(r=>setTimeout(r,5));
+  assert.equal(details,2);assert.equal(f.calls(),1);
+  assert.equal(f.task.results.find(r=>r.job.jobId==='j0').ai.score,76);
+  assert.equal(f.task.results.find(r=>r.job.jobId==='j1').selected,false);
+  assert.equal(f.task.results.find(r=>r.job.jobId==='j2').ai,undefined);
+  assert.equal(f.task.items[1].state,'SKIPPED');
+  const {progress}=await f.call('STATE');
+  assert.equal(progress.running,false);assert.equal(progress.done,2);
+  assert.match(progress.message,/ACTIVITY_API_37/);assert.match(progress.message,/评分成功 1，未取得评分 1，未处理 1/);
+});
+await test('malformed model JSON is retried once with the same evidence, without guessing or persisting partial scores',async()=>{
+  for (const malformed of ['{"reason":"missing comma" "gaps":[]}', '{} extra', '{"score":profile_null}']) {
+    const f=fixture({resumeText:'真实简历'.repeat(20),resumeConfirmed:true});f.session[CAREER_SECRET]='key';
+    const inputs=[];
+    globalThis.fetch=async(url,options)=>{inputs.push(JSON.parse(options.body).messages[1].content);return{ok:true,json:async()=>({choices:[{message:{content:inputs.length===1?malformed:JSON.stringify(rawScore)}}]})};};
+    const job={jobId:'json',jd:'完整职责',jdVerified:true};
+    assert.equal((await f.service.scoreJob(job)).score,76);assert.equal(inputs.length,2);assert.equal(inputs[0],inputs[1]);
+    let calls=0;globalThis.fetch=async()=>{calls++;return{ok:true,json:async()=>({choices:[{message:{content:malformed}}]})};};
+    await assert.rejects(()=>f.service.scoreJob({...job,jobId:'invalid'}),/JSON/);assert.equal(calls,2);
+    assert.equal(Object.keys(f.local[CAREER_KEY].scores).length,1);
+  }
+});
+await test('detail stop signal is shared across requests and successful requests are spaced',async()=>{
+  const content=fs.readFileSync('extension/content/content-main.js','utf8');
+  const fn=content.slice(content.indexOf('  async function fetchJobActivityDetail('),content.indexOf('  async function enrichJobActivities('));
+  for(const failure of [{ok:true,json:async()=>({code:37})},{ok:false,status:429},{ok:false,status:403}]){
+    let requests=0,now=10000;const times=[];
+    const get=new Function('fetch','Date','sleep','location','rememberJobNetworkMetadata',
+      'let jobDetailHalt=null,jobDetailLastRequestAt=0;const jobNetworkMetadata=new Map();'+fn+';return fetchJobActivityDetail;')(
+      async()=>{requests++;times.push(now);return requests<3?{ok:true,json:async()=>({code:0,zpData:{jobInfo:{encryptId:'j',postDescription:'完整职责'}}})}:failure;},
+      {now:()=>now},async ms=>{now+=ms;},{origin:'https://fixture.invalid'},x=>x);
+    const job={jobId:'j',securityId:'fixture',lid:'fixture'};
+    assert.equal((await get(job)).detailVerified,true);await get(job);
+    assert.ok(times[1]-times[0]>=1000);
+    const stopped=await get(job);assert.equal(stopped.halt,true);
+    assert.deepEqual(await get(job),stopped);assert.equal(requests,3);
+  }
+});
+await test('three incomplete job descriptions do not prevent subsequent valid jobs from scoring',async()=>{
+  const f=fixture({resumeText:'真实简历'.repeat(20),resumeConfirmed:true});f.session[CAREER_SECRET]='key';
+  f.task.results=Array.from({length:6},(_,i)=>({decision:'pass',selected:true,reasonCodes:[],reasonTexts:[],job:{jobId:'j'+i}}));
+  let details=0;f.hooks.detail=async()=>{details++;return{ok:true,detailVerified:true,jd:details<=3?'':'完整职责和要求'};};
+  await f.call('SCORE_START');
+  for(let i=0;i<100&&(await f.call('STATE')).progress.running;i++)await new Promise(r=>setTimeout(r,5));
+  assert.equal(details,6);assert.equal(f.calls(),3);
+  assert.equal(f.task.results.filter(r=>r.ai?.error).length,3);
+  assert.equal(f.task.results.filter(r=>r.decision==='pass').length,3);
+  assert.match((await f.call('STATE')).progress.message,/评分结束：评分成功 3，未取得评分 3，未处理 0/);
+});
+await test('repeated system failures still stop the batch without fabricating scores',async()=>{
+  const f=fixture({resumeText:'真实简历'.repeat(20),resumeConfirmed:true});f.session[CAREER_SECRET]='key';
+  f.task.results=Array.from({length:6},(_,i)=>({decision:'pass',selected:true,reasonCodes:[],reasonTexts:[],job:{jobId:'j'+i}}));
+  let calls=0;f.hooks.detail=async()=>{calls++;throw new Error('fixture transport unavailable');};
+  await f.call('SCORE_START');
+  for(let i=0;i<100&&(await f.call('STATE')).progress.running;i++)await new Promise(r=>setTimeout(r,5));
+  assert.equal(calls,3);assert.equal(f.calls(),0);
+  assert.match((await f.call('STATE')).progress.message,/连续 3 次系统调用失败/);
+  assert.match((await f.call('STATE')).progress.message,/未处理 3/);
+});
+await test('incomplete detail responses identify missing identity separately from empty JD',async()=>{
+  const f=fixture({resumeText:'真实简历'.repeat(20),resumeConfirmed:true});
+  f.hooks.detail=async()=>({ok:true,detailVerified:false,jd:'完整正文'});
+  await assert.rejects(()=>f.service.scoreJob({jobId:'j'}),/详情缺少可核对的岗位 ID/);
+  f.hooks.detail=async()=>({ok:true,detailVerified:true,jd:''});
+  await assert.rejects(()=>f.service.scoreJob({jobId:'j'}),/职位正文为空/);
+  f.hooks.detail=async()=>undefined;
+  await assert.rejects(()=>f.service.scoreJob({jobId:'j'}),/页面未返回详情/);
+  assert.equal(f.calls(),0);
+});
+await test('detail check needs no key, selects one failed job and does not change the task',async()=>{
+  const f=fixture();f.task.results.push({job:{jobId:'failed-job'},ai:{error:'详情不足'},decision:'reject'});
+  const before=structuredClone(f.task);let details=0;
+  f.hooks.detail=async job=>{assert.equal(job.jobId,'failed-job');details++;return{ok:true,detailVerified:true,jd:''};};
+  const result=await f.call('DETAIL_CHECK');
+  assert.equal(result.ok,true);assert.match(result.message,/职位正文为空/);assert.match(result.message,/本次未调用 AI/);
+  assert.equal(details,1);assert.equal(f.calls(),0);assert.deepEqual(f.task,before);
+  f.task.status='running';assert.equal((await f.call('DETAIL_CHECK')).ok,false);assert.equal(details,1);
 });
 await test('HR polling uses confirmed facts once; repeated message IDs are not resent',async()=>{
   const f=fixture({monitorEnabled:true,facts:{education:'本科'}});

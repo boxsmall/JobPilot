@@ -1852,8 +1852,8 @@ test("preview filters HR activity via network metadata and marks current deliver
   // 预览期用列表接口元数据核对活跃度（不点卡片），不满足的岗位在预览即排除
   assert.ok(background.includes("matchActive(activeText, selected)"), "preview finalize applies matchActive");
   assert.ok(background.includes("不点卡片"), "preview activity check is network-only");
-  assert.ok(background.includes("ENRICH_JOB_ACTIVITY"), "preview enriches via detail API message");
-  assert.ok(background.includes("applyPreviewActivityEnrichment(results, activities"), "enrichment results applied to preview");
+  const previewCode = background.slice(background.indexOf('async function runPreview('), background.indexOf('async function refreshAndContinue('));
+  assert.ok(!previewCode.includes('MSG.ENRICH_JOB_ACTIVITY'), 'preview does not call the private detail API');
   assert.ok(background.includes("HR 活跃度核对（列表接口元数据"), "preview activity summary logged");
   // 预览项带 jobId，供投递时高亮定位
   assert.ok(app.includes("div.dataset.job = String(r.job.jobId || '')"), "preview item carries jobId");
