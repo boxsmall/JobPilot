@@ -1,6 +1,6 @@
 {
   "name": "jobpilot",
-  "version": "1.7.45",
+  "version": "1.7.51",
   "private": true,
   "type": "module",
   "description": "职航 JobPilot：AI 求职与投递助手",
@@ -12,7 +12,7 @@
     "release:check": "node scripts/sync-release-notes.mjs",
     "release:sync": "node scripts/sync-release-notes.mjs --apply",
     "test:career": "node scripts/career-tests.mjs",
-    "test:career:browser": "node scripts/career-browser-tests.mjs",
+    "test:career:browser": "node scripts/career-browser-tests.mjs && node scripts/career-detail-browser-tests.mjs",
     "vendor:career": "node scripts/vendor-career.mjs",
     "check": "node scripts/unit-tests.mjs && node scripts/flow-tests.mjs && node scripts/background-delivery-tests.mjs && node scripts/audit-regression-tests.mjs && node scripts/update-reminder-tests.mjs && node scripts/smoke-test.mjs && node scripts/career-tests.mjs"
   },

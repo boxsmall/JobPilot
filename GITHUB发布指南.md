@@ -26,7 +26,7 @@ git push origin main
 
 1. 配置自己的 DeepSeek Key，在真实 BOSS 页面验证岗位读取、会话识别、附件选择和发送回执。
 2. 执行 `pnpm install --frozen-lockfile`、`pnpm run check`，需要时运行浏览器测试。
-3. 确定 JobPilot 自己的版本号，同步 package、manifest、面板、content、floating-host 和测试桩；目前沿用的 1.7.45 是上游内核版本。
+3. 每次安装更新递增 JobPilot 版本号，同步 package、manifest、面板（含 career-panel）、content、floating-host 和测试桩；当前本地版本为 1.7.51。不能只覆盖文件而保留相同版本，否则已打开的页面和后台可能继续运行旧代码。
 4. 把 `extension/` 内的文件打成 ZIP，ZIP 根目录直接包含 manifest.json，并附上 LICENSE。
 5. 在自己的 GitHub Releases 上传安装包。当前文件夹里的安装包是本地开发版，不表示已发布。
 6. 有了自己的发布地址后，再修改 update-policy 中的更新源、地址校验和主页，并启用后台与面板更新检查；不要直接重新开启指向上游的更新。
