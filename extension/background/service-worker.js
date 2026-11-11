@@ -1,4 +1,5 @@
 import { createCareerService } from './career-service.js';
+import { createCareerDetailReader } from './career-detail-reader.js';
 import { MSG } from '../shared/messaging.js';
 import {
   appendHistory,
@@ -3181,30 +3182,8 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
     const todayStats = await getTodayStats();
     if (!isActive()) return cancelled();
     const results = evaluatePreviewResults(Array.from(collectedJobs.values()), config, todayStats);
-    // 预览期核对 HR 活跃度：直连列表 detail API（不点卡片、不离开列表页），
-    // 让「预览通过」≈「投递会投」，避免队列尾部混入大量的「投递时才被判跳过」岗位。
-    // 网络元数据（job.activeText）直接过滤；缺失的逐岗抓取 detail API（限时，熔断 429/403）。
-    {
-      const pending = results.filter((row) => row.decision === 'pass' && row.requiresActiveCheck === true);
-      if (pending.length && isActive()) {
-        const enrich = await sendToBoss(
-          MSG.ENRICH_JOB_ACTIVITY,
-          {
-            jobs: pending.slice(0, 80).map((r) => r.job),
-            deadlineAt: Date.now() + 60000
-          },
-          { tabId: sourcePreviewTab?.id || previewTab?.id || null, previewRunId }
-        ).catch(() => null);
-        const activities = Array.isArray(enrich?.activities) ? enrich.activities : [];
-        if (activities.length) {
-          applyPreviewActivityEnrichment(results, activities, config.filters?.activeWithin || []);
-          await log('info', `[预览] HR 活跃度核对（列表接口 detail API，不点卡片）：已核对 ${activities.length}/${pending.length} 岗，不满足的已从队列排除`, { previewRunId });
-        }
-        if (enrich?.halted) {
-          await log('warn', `[预览] HR 活跃度核对提前停止（${enrich.haltError || '未知原因'}），其余岗位保持投递时核对`, { previewRunId });
-        }
-      }
-    }
+    // Preview uses only metadata already supplied by the normal list page.
+    // Missing HR activity is checked on the ordinary detail page at delivery.
     const activityMeta = {
       requested: 0,
       eligible: 0,
@@ -5336,20 +5315,24 @@ async function runTaskLoop(taskId, taskRunId = uid('run')) {
   }
 }
 
+const careerDetailReader = createCareerDetailReader({ chrome, version: BHT_RUNTIME_VERSION,
+  inject: forceInjectContent, waitReady: waitTabComplete, sleep });
 const career = createCareerService({
   config: getAllConfig, publish: publishTask, summarize: summarizePreview, log,
   exclusive: (fn) => withRunnerAdmission('careerBusy', fn),
-  detail: async (job, tabId) => {
-    const tab = tabId ? { id: tabId } : await getActiveBossTab({ allowInactiveBossTab: true });
-    if (!tab?.id) return { ok: false, error: '请打开 BOSS 职位列表' };
-    return chrome.tabs.sendMessage(tab.id, { type: 'BHT_CAREER_JOB_DETAIL', payload: { job } });
-  }
+  detail: job => careerDetailReader.read(job),
+  closeDetail: () => careerDetailReader.close(),
+  cancelDetail: () => careerDetailReader.cancel()
 });
 career.init().catch(() => {});
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const { type } = message || {};
   if (String(type).startsWith('BHT_AI_')) {
+    if (message.clientVersion !== BHT_RUNTIME_VERSION) {
+      sendResponse({ ok: false, message: `AI 界面与后台版本不一致（界面 ${message.clientVersion || '旧版'} / 后台 ${BHT_RUNTIME_VERSION}），请重新加载 JobPilot 并刷新 BOSS 页面` });
+      return false;
+    }
     career.handle(type, message.payload, sender).then(sendResponse);
     return true;
   }
