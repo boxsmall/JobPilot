@@ -126,6 +126,8 @@
             <label for="career_minScore">最低匹配分（0–100）</label><input id="career_minScore" type="number" min="0" max="100" value="70" />
             <p class="hint">技能 40% · 经历 30% · 薪资 20% · 发展 10%。未知维度不计入权重。未取得完整 JD 或 AI 评分失败时暂停投递。</p>
             <div class="btn-row"><button id="careerScore" class="btn primary">为扫描结果评分</button><button id="careerScoreStop" class="btn" disabled>停止评分</button><button id="careerRecommend" class="btn">推荐报告</button></div>
+            <button id="careerRetryScore" class="btn">补全未评分岗位</button><p class="hint">保留资料未变化的有效评分，只处理未完成或资料已变化的岗位。</p>
+            <button id="careerDetailCheck" class="btn">检查职位详情</button><p class="hint">只检查一个失败岗位，不调用 AI，无需密钥。</p>
             <progress id="careerScoreProgress" value="0" max="1" aria-label="AI 评分进度"></progress><p id="careerProgress" class="hint"></p>
             <p class="hint">评分结果回到任务页展示并排序。自动投递沿用任务页的批量、定时与目标模式。</p>
           </div>

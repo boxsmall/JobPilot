@@ -1,12 +1,13 @@
 import { endpointURL, dayKey } from '../shared/career-policy.js';
 const $ = id => document.getElementById(id);
+const CAREER_UI_VERSION = '1.7.51';
 let loaded = false, dirty = false, lastState, lastReport = '', reportName = '', pollBusy = false;
 const fields = ['endpoint', 'model', 'enabled', 'minScore', 'resumeText', 'resumeConfirmed', 'preferences', 'monitorEnabled', 'autoReply', 'autoResume', 'dailyReplyLimit', 'resumeName'];
 const facts = ['intro', 'skills', 'experience', 'education', 'location'];
 const labels = { intro: '个人介绍', skills: '主要技能', experience: '工作 / 项目经历', education: '学历', location: '现居城市' };
 const status = message => { $('careerStatus').textContent = message; };
 async function call(action, payload = {}) {
-  const result = await chrome.runtime.sendMessage({ type: 'BHT_AI_' + action, payload });
+  const result = await chrome.runtime.sendMessage({ type: 'BHT_AI_' + action, payload, clientVersion: CAREER_UI_VERSION });
   if (!result?.ok) throw new Error(result?.message || result?.error || '操作失败');
   return result;
 }
@@ -68,6 +69,8 @@ async function refresh() {
     $('careerKeyStatus').textContent = data.hasKey ? '已设置；仅保留在本次浏览器会话' : '未设置；重启浏览器后请重新填写';
     $('careerProgress').textContent = data.progress.message || '先在任务页扫描岗位，再运行 AI 评分';
     $('careerScore').disabled = data.progress.running;
+    $('careerRetryScore').disabled = data.progress.running;
+    $('careerDetailCheck').disabled = data.progress.running;
     $('careerScoreStop').disabled = !data.progress.running;
     $('careerScoreProgress').max = Math.max(1, data.progress.total); $('careerScoreProgress').value = data.progress.done;
     renderInteractions(data.state.interactions || []);
@@ -127,6 +130,8 @@ $('careerExtract').onclick = e => run(e.currentTarget, async () => {
   $('careerFactsConfirmed').checked = false; $('careerFacts').closest('details').open = true; dirty = true; status('已提取个人信息草稿；核对并确认后保存，才会用于自动回复');
 });
 $('careerScore').onclick = e => run(e.currentTarget, async () => { if (dirty) throw new Error('请先保存修改'); await call('SCORE_START'); await refresh(); });
+$('careerRetryScore').onclick = e => run(e.currentTarget, async () => { if (dirty) throw new Error('请先保存修改'); await call('SCORE_START', { retryOnly: true }); await refresh(); });
+$('careerDetailCheck').onclick = e => run(e.currentTarget, async () => { status((await call('DETAIL_CHECK')).message); });
 $('careerScoreStop').onclick = e => run(e.currentTarget, () => call('SCORE_STOP'));
 $('careerRecommend').onclick = e => run(e.currentTarget, async () => showReport((await call('RECOMMEND')).report, '岗位推荐报告.md'));
 $('careerDailyDate').value = dayKey();
