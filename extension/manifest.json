@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "职航 JobPilot — AI 求职助手",
   "description": "简历解析、AI 岗位匹配、自动投递、HR 消息处理与求职日报",
-  "version": "1.7.45",
+  "version": "1.7.51",
   "default_locale": "zh_CN",
   "icons": {
     "16": "assets/icons/icon16.png",
