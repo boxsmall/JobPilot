@@ -1,0 +1,2580 @@
+import assert from "assert";
+import {
+  evaluateJob,
+  matchActive,
+  classifyActive,
+  normalizeActiveWithin,
+  summarizePreview,
+  previewReasonLines
+} from "../extension/shared/filter-engine.js";
+import { includesKeyword, isSimilar, normalizeMatchText, parseSalaryRange, normalizeText, parseKeywords } from "../extension/shared/text-utils.js";
+import { planMessageSegments } from "../extension/shared/message-planner.js";
+import {
+  DEFAULT_TARGET_NO_NEW_RETRY_LIMIT,
+  MESSAGE_MODES,
+  MESSAGE_SEGMENT_KINDS,
+  STORAGE_KEYS,
+  normalizeTargetNoNewRetryLimit
+} from "../extension/shared/constants.js";
+import {
+  NATIVE_GREETING_STATES,
+  normalizeMessageSegmentKind,
+  normalizeMessageTemplateRoles,
+  resolveNativeGreetingEvidence
+} from "../extension/shared/greeting-policy.js";
+import { checkDedup, checkLimits, segmentIdempotencyKey, jobIdempotencyKey } from "../extension/shared/dedup.js";
+import { renderTemplate, pickResumeProfile } from "../extension/shared/template.js";
+import { filterHistoryRows, filterHistoryByDate, summarizeHistory, startOfLocalDay, endOfLocalDay, normalizeHistoryDateRange } from "../extension/shared/history-view.js";
+import { planResumeSend } from "../extension/shared/resume-policy.js";
+import { buildExportPayload, importConfigPatch, IMPORT_CONFIG_KEYS, sanitizeImportedTask, normalizeSettings, saveSettings, normalizeFilters, saveFilters, getAllConfig } from "../extension/shared/storage.js";
+import { isBossUrl, isBossHostname, isBossTab, bossUrlGuardMessage } from "../extension/shared/boss-url.js";
+import {
+  didContentDocumentChange,
+  isBossJobListUrl,
+  resolveBossJobListUrl,
+  sameJobListUrl
+} from "../extension/shared/job-list-navigation.js";
+import {
+  buildConversationWorkerAttempts,
+  CONVERSATION_WORKER_MODE,
+  isListDocumentPreserved
+} from "../extension/shared/conversation-worker.js";
+import { reasonText, REASON } from "../extension/shared/reason-codes.js";
+import { computeSideBySideBounds, snapshotWindowBounds, windowBoundsMatch } from "../extension/shared/window-layout.js";
+import { isSyntheticJobId, listJobIdentityMismatch } from "../extension/shared/job-identity.js";
+import {
+  dedupeResumeImages,
+  mergeResumeImages,
+  normalizeResumes
+} from "../extension/shared/resume-images.js";
+import "../extension/shared/conversation-match.js";
+import "../extension/shared/trigger-navigation-recovery.js";
+import "../extension/shared/operation-dispatch-gate.js";
+import fs from "fs";
+import vm from "vm";
+import { pickNextTestDeliveryJob, collectDoneJobIds } from "../extension/shared/test-delivery.js";
+import {
+  buildDeliveryQueue,
+  countPassJobs,
+  countPendingPassJobs,
+  jobMergeKey,
+  jobsShareMergeIdentity,
+  mergeTaskResults,
+  rebuildDeliveryQueue,
+  countSuccessfulDeliveries,
+  targetDeliveryRemaining,
+  isTargetDeliveryReached,
+  taskCounterSnapshot,
+  shouldAcceptTaskSnapshot
+} from "../extension/shared/task-model.js";
+import {
+  JOB_SOURCE_TYPES,
+  expectationDisplayLabel,
+  findExpectationMatches,
+  sameFilterSignature,
+  sameJobSourceContext
+} from "../extension/shared/job-expect-context.js";
+import { createOperationRegistry } from "../extension/background/operation-registry.js";
+import {
+  isEnvironmentalFailure,
+  ENV_AUTO_CONTINUE_ERRORS,
+  isWorkerTriggerRetryable,
+  canFallbackWorkerMode,
+  WORKER_TRIGGER_RETRY,
+  WORKER_TRIGGER_RETRYABLE_ERRORS
+} from "../extension/shared/environment-failures.js";
+import { appendSessionDebugLog, getSessionDebugLogs } from "../extension/shared/debug-log.js";
+import {
+  isScanResultWithinFinalizationWindow,
+  OPERATION_TIMEOUTS,
+  resolveBridgeTimeoutMs,
+  resolvePageOperationTimeoutMs
+} from "../extension/shared/operation-timeouts.js";
+import {
+  PREVIEW_SCAN_STOP,
+  resolvePreviewScanStop
+} from "../extension/shared/preview-scan-policy.js";
+import {
+  formatLogTimestamp,
+  mergeRuntimeLog,
+  sortLogsNewestFirst,
+  sortLogsOldestFirst
+} from "../extension/shared/log-order.js";
+import {
+  DELIVERY_SCHEDULE_WINDOWS,
+  DEFAULT_DELIVERY_SCHEDULE_WINDOWS,
+  evaluateDeliverySchedule,
+  formatDeliveryScheduleStatus,
+  nextDeliveryScheduleStart,
+  normalizeDeliveryScheduleDays,
+  normalizeDeliveryScheduleWindows,
+  diagnoseDeliveryScheduleWindows
+} from "../extension/shared/delivery-schedule.js";
+import {
+  isNonChatApplyLabel,
+  NON_CHAT_APPLY_LABELS
+} from "../extension/shared/non-chat-job.js";
+
+const {
+  hasActiveState,
+  cleanHrIdentity,
+  stableConversationKey,
+  selectConversationCandidate,
+  confirmRenderedOwnMessage
+} = globalThis.BHTConversationMatch;
+const { resolveTriggerNavigationRecovery } = globalThis.BHTTriggerNavigationRecovery;
+const { awaitOperationDispatchPermit } = globalThis.BHTOperationDispatchGate;
+
+let passed = 0;
+const registeredTests = [];
+function test(name, fn) {
+  registeredTests.push({ name, fn });
+}
+
+async function runRegisteredTests() {
+  for (const { name, fn } of registeredTests) {
+    try {
+      await fn();
+      passed++;
+      console.log("  PASS", name);
+    } catch (e) {
+      console.error("  FAIL", name, "-", e.message);
+      process.exitCode = 1;
+    }
+  }
+}
+
+console.log("1) text-utils");
+test("normalize greeting", () => {
+  assert.ok(normalizeText("您好，世界").length > 0);
+});
+test("message segment role prefers current editor value", () => {
+  assert.equal(normalizeMessageSegmentKind("greeting", MESSAGE_SEGMENT_KINDS.SUPPLEMENT), MESSAGE_SEGMENT_KINDS.GREETING);
+  assert.equal(normalizeMessageSegmentKind("supplement", MESSAGE_SEGMENT_KINDS.GREETING), MESSAGE_SEGMENT_KINDS.SUPPLEMENT);
+  assert.equal(normalizeMessageSegmentKind("unknown", MESSAGE_SEGMENT_KINDS.SUPPLEMENT), MESSAGE_SEGMENT_KINDS.SUPPLEMENT);
+});
+test("similar greetings", () => {
+  assert.ok(isSimilar("您好，我对这个岗位很感兴趣", "你好，我对该职位很感兴趣！", 0.85));
+});
+test("greeting without punctuation still matches native hello", () => {
+  assert.ok(isSimilar("您好我对这个岗位很感兴趣", "你好，我对该职位很感兴趣", 0.85));
+  assert.equal(normalizeText("history"), "history");
+});
+test("salary parse 15-25K", () => {
+  const s = parseSalaryRange("15-25K·14薪");
+  assert.equal(s.min, 15000);
+  assert.equal(s.max, 25000);
+});
+test("salary parse does not treat daily yuan as monthly K", () => {
+  const daily = parseSalaryRange("400-450元/天");
+  assert.ok(daily.min < 20000, "daily 400 yuan must not become 400000");
+  assert.ok(daily.max < 20000, "daily 450 yuan must not become 450000");
+  assert.ok(daily.min >= 400);
+  assert.ok(daily.max >= 450);
+  const monthly = parseSalaryRange("15-25K");
+  assert.equal(monthly.min, 15000);
+  assert.equal(monthly.max, 25000);
+  const bare = parseSalaryRange("15-25");
+  assert.equal(bare.min, 15000);
+  assert.equal(bare.max, 25000);
+});
+test("parseKeywords", () => {
+  assert.deepEqual(parseKeywords("Java, Go，后端"), ["Java", "Go", "后端"]);
+});
+test("parseKeywords multi separators", () => {
+  assert.deepEqual(parseKeywords("Java,Go，Spring、Redis\\Docker/K8s"), [
+    "Java",
+    "Go",
+    "Spring",
+    "Redis",
+    "Docker",
+    "K8s"
+  ]);
+  assert.deepEqual(parseKeywords("外包、驻场,销售"), ["外包", "驻场", "销售"]);
+});
+
+console.log("2) filter-engine");
+const filters = {
+  title: { or: ["Java", "后端"], not: ["外包"] },
+  company: { or: [], not: [] },
+  jd: { or: [], not: ["驻场"] },
+  location: { include: ["广州"], exclude: [], mode: "contains" },
+  salaryMin: 10000,
+  salaryMax: null,
+  excludeHunter: true,
+  excludeOutsource: true,
+  activeWithin: ""
+};
+const passJob = {
+  jobId: "1",
+  title: "Java Agent 开发",
+  company: "某某科技",
+  jd: "负责 Agent 与后端",
+  location: "广州·天河",
+  salary: "15-25K"
+};
+test("pass matching job", () => assert.equal(evaluateJob(passJob, filters, {}, {}).decision, "pass"));
+test("reject not keyword", () => assert.equal(evaluateJob({ ...passJob, title: "Java 外包开发" }, filters, {}, {}).decision, "reject"));
+test("reject location", () => assert.equal(evaluateJob({ ...passJob, location: "佛山" }, filters, {}, {}).decision, "reject"));
+test("blacklist company", () => {
+  const r = evaluateJob(passJob, filters, { companyBlacklist: ["某某科技"] }, {});
+  assert.equal(r.decision, "reject");
+  assert.ok(r.reasonCodes.includes(REASON.FILTER_BLACKLIST_COMPANY));
+});
+test("summary counts", () => {
+  const s = summarizePreview([{ decision: "pass" }, { decision: "reject", reasonCodes: ["X"] }]);
+  assert.equal(s.pass, 1);
+  assert.equal(s.reject, 1);
+});
+test("disabled OR keeps keywords but ignores the rule", () => {
+  const disabled = structuredClone(filters);
+  disabled.title.enabled = { or: false, not: true };
+  const r = evaluateJob({ ...passJob, title: "Python Agent 开发" }, disabled, {}, {});
+  assert.equal(r.decision, "pass");
+});
+test("disabled NOT allows a stored exclusion keyword", () => {
+  const disabled = structuredClone(filters);
+  disabled.title.enabled = { or: true, not: false };
+  disabled.excludeOutsource = false;
+  const r = evaluateJob({ ...passJob, title: "Java Agent 外包开发" }, disabled, {}, {});
+  assert.equal(r.decision, "pass");
+});
+test("disabled location include ignores stored locations", () => {
+  const disabled = structuredClone(filters);
+  disabled.location.enabled = { include: false, exclude: true };
+  const r = evaluateJob({ ...passJob, location: "佛山" }, disabled, {}, {});
+  assert.equal(r.decision, "pass");
+});
+test("daily yuan salary is compared as monthly, not as inflated K", () => {
+  const r = evaluateJob({ ...passJob, salary: "400-450元/天" }, filters, {}, {});
+  assert.equal(r.decision, "reject");
+  assert.ok(r.reasonCodes.includes(REASON.FILTER_SALARY_LOW));
+});
+test("legacy AND never affects evaluation, OR and NOT still apply", () => {
+  const legacy = structuredClone(filters);
+  for (const field of ["title", "company", "jd"]) {
+    legacy[field].and = ["不会出现的必需词"];
+    legacy[field].enabled = { or: true, not: true, and: true };
+  }
+  const result = evaluateJob({ ...passJob, title: "Java 开发" }, legacy, {}, {});
+  assert.equal(result.decision, "pass");
+  assert.ok(!result.passReasons.some((text) => text.includes("必需词")));
+  assert.equal(evaluateJob({ ...passJob, title: "Python 开发" }, legacy, {}, {}).decision, "reject");
+  const excluded = evaluateJob({ ...passJob, title: "Java 外包开发" }, legacy, {}, {});
+  assert.ok(excluded.reasonCodes.includes(REASON.FILTER_TITLE_NOT_HIT));
+  assert.equal(evaluateJob(passJob, { ...filters, title: { or: [], not: [] } }, {}, {}).decision, "pass");
+});
+test("company OR miss / company NOT / JD OR miss", () => {
+  const companyOr = evaluateJob(passJob, { ...filters, company: { or: ["字节"], not: [] } }, {}, {});
+  assert.equal(companyOr.decision, "reject");
+  assert.ok(companyOr.reasonCodes.includes(REASON.FILTER_COMPANY_OR_MISS));
+  const companyNot = evaluateJob(passJob, { ...filters, company: { or: [], not: ["科技"] } }, {}, {});
+  assert.equal(companyNot.decision, "reject");
+  assert.ok(companyNot.reasonCodes.includes(REASON.FILTER_COMPANY_NOT_HIT));
+  const jdOr = evaluateJob(passJob, { ...filters, jd: { or: ["Golang"], not: [] } }, {}, {});
+  assert.equal(jdOr.decision, "reject");
+  assert.ok(jdOr.reasonCodes.includes(REASON.FILTER_JD_OR_MISS));
+});
+test("location exclude / exact location / salary high", () => {
+  const locEx = evaluateJob(passJob, { ...filters, location: { include: [], exclude: ["天河"], mode: "contains" } }, {}, {});
+  assert.equal(locEx.decision, "reject");
+  assert.ok(locEx.reasonCodes.includes(REASON.FILTER_LOCATION_EXCLUDED));
+  const exact = evaluateJob(passJob, { ...filters, location: { include: ["广州"], exclude: [], mode: "exact" } }, {}, {});
+  assert.equal(exact.decision, "reject");
+  assert.ok(exact.reasonCodes.includes(REASON.FILTER_LOCATION_MISS));
+  const high = evaluateJob({ ...passJob, salary: "40-60K" }, { ...filters, salaryMax: 20000 }, {}, {});
+  assert.equal(high.decision, "reject");
+  assert.ok(high.reasonCodes.includes(REASON.FILTER_SALARY_HIGH));
+});
+test("HR active / hunter / outsource / whitelist-only", () => {
+  const active = evaluateJob({ ...passJob, activeText: "本月活跃" }, { ...filters, activeWithin: "today" }, {}, {});
+  assert.equal(active.decision, "reject");
+  assert.ok(active.reasonCodes.includes(REASON.FILTER_ACTIVE));
+  assert.equal(matchActive("本周活跃", ["week"]), true);
+  assert.equal(matchActive("本周活跃", ["today"]), false);
+  assert.equal(matchActive("刚刚活跃", ["week"]), true);
+  assert.equal(matchActive("刚刚活跃", ["just"]), true);
+  assert.equal(matchActive("在线", ["just"]), true);
+  assert.equal(matchActive("在线", ["online"]), true);
+  assert.equal(matchActive("今日活跃", ["week"]), true);
+  assert.equal(matchActive("两周内活跃", ["2w"]), true);
+  assert.equal(matchActive("2周内活跃", ["2w"]), true);
+  assert.equal(matchActive("3日内活跃", ["3d"]), true);
+  assert.equal(matchActive("2月内活跃", ["half"]), true);
+  assert.equal(matchActive("3月内活跃", ["half"]), true);
+  assert.equal(matchActive("4月内活跃", ["half"]), true);
+  assert.equal(matchActive("半年前活跃", ["half"]), true);
+  assert.equal(matchActive("半年前活跃", ["month"]), false);
+  assert.equal(matchActive("本月活跃", ["week"]), false);
+  assert.equal(matchActive("一年前活跃", ["half"]), false);
+  assert.equal(matchActive("", ["week"]), false);
+  assert.equal(classifyActive("在线"), "online");
+  assert.equal(classifyActive("刚刚活跃"), "just");
+  assert.equal(classifyActive("本周活跃"), "week");
+  assert.equal(classifyActive("两周内活跃"), "2w");
+  assert.equal(classifyActive("3日内活跃"), "3d");
+  assert.equal(classifyActive("2月内活跃"), "2m");
+  assert.equal(classifyActive("3月内活跃"), "3m");
+  assert.equal(classifyActive("4月内活跃"), "4m");
+  assert.equal(classifyActive("5月内活跃"), "half");
+  assert.equal(classifyActive("6月内活跃"), "half");
+  assert.equal(classifyActive("1月内活跃"), "month");
+  assert.equal(matchActive("5月内活跃", ["half"]), true);
+  assert.equal(matchActive("5月内活跃", ["today"]), false);
+  assert.equal(matchActive("6月内活跃", ["month"]), false);
+  assert.equal(classifyActive("半年前活跃"), "half");
+  assert.equal(classifyActive("一年前活跃"), "year");
+  assert.equal(classifyActive("3日前活跃"), "3d");
+  assert.equal(matchActive("3日前活跃", ["3d"]), true);
+  assert.equal(matchActive("3日前活跃", ["today"]), false);
+  assert.deepEqual(normalizeActiveWithin("week"), ["week"]);
+  assert.deepEqual(normalizeActiveWithin(["just", "week"]), ["week"]);
+  assert.deepEqual(normalizeActiveWithin(["2m"]), ["half"]);
+  const hunter = evaluateJob({ ...passJob, hrTitle: "猎头顾问" }, filters, {}, {});
+  assert.equal(hunter.decision, "reject");
+  assert.ok(hunter.reasonCodes.includes(REASON.FILTER_HUNTER));
+  const recruiter = evaluateJob({ ...passJob, hrTitle: "招聘专员" }, filters, {}, {});
+  assert.equal(recruiter.decision, "pass");
+  const goldHunter = evaluateJob({ ...passJob, goldHunter: 1 }, filters, {}, {});
+  assert.equal(goldHunter.decision, "reject");
+  assert.ok(goldHunter.reasonCodes.includes(REASON.FILTER_HUNTER));
+  const out = evaluateJob(
+    { ...passJob, company: "某某人力外包" },
+    { ...filters, jd: { or: [], and: [], not: [] } },
+    {},
+    {}
+  );
+  assert.equal(out.decision, "reject");
+  assert.ok(out.reasonCodes.includes(REASON.FILTER_OUTSOURCE));
+  const white = evaluateJob(passJob, filters, { companyWhitelist: ["字节"] }, { whitelistOnly: true });
+  assert.equal(white.decision, "reject");
+  assert.ok(white.reasonCodes.includes(REASON.FILTER_WHITELIST_COMPANY));
+});
+test("unknown HR activity is deferred only for preview and remains strict by default", () => {
+  const activeFilters = { ...filters, activeWithin: ["week"] };
+  const strict = evaluateJob(passJob, activeFilters, {}, {});
+  assert.equal(strict.decision, "reject");
+  assert.ok(strict.reasonCodes.includes(REASON.FILTER_ACTIVE));
+
+  const preview = evaluateJob(passJob, activeFilters, {}, {}, { deferUnknownActive: true });
+  assert.equal(preview.decision, "pass");
+  assert.equal(preview.requiresActiveCheck, true);
+  assert.ok(!preview.passReasons.some((text) => /未知|待校验/.test(text)));
+
+  const known = evaluateJob(
+    { ...passJob, activeText: "本周活跃" },
+    activeFilters,
+    {},
+    {},
+    { deferUnknownActive: true }
+  );
+  assert.equal(known.decision, "pass");
+  assert.equal(known.requiresActiveCheck, false);
+
+  const nearer = evaluateJob(
+    { ...passJob, activeText: "刚刚活跃" },
+    activeFilters,
+    {},
+    {}
+  );
+  assert.equal(nearer.decision, "pass");
+  const exactWeek = evaluateJob(
+    { ...passJob, activeText: "本周活跃" },
+    activeFilters,
+    {},
+    {}
+  );
+  assert.equal(exactWeek.decision, "pass");
+  const olderMonth = evaluateJob(
+    { ...passJob, activeText: "本月活跃" },
+    activeFilters,
+    {},
+    {}
+  );
+  assert.equal(olderMonth.decision, "reject");
+});
+test("disabled company OR and JD NOT ignore stored keywords", () => {
+  const companyOff = evaluateJob(
+    passJob,
+    { ...filters, company: { or: ["字节"], not: [], enabled: { or: false, not: true } } },
+    {},
+    {}
+  );
+  assert.equal(companyOff.decision, "pass");
+  const jdOff = evaluateJob(
+    { ...passJob, jd: "驻场开发 Agent" },
+    { ...filters, jd: { or: [], and: [], not: ["驻场"], enabled: { or: true, and: true, not: false } }, excludeOutsource: false },
+    {},
+    {}
+  );
+  assert.equal(jdOff.decision, "pass");
+});
+test("empty filters still expose a pass reason for preview rows", () => {
+  const empty = { title: {}, company: {}, jd: {}, location: {} };
+  const r = evaluateJob(passJob, empty, {}, {});
+  assert.equal(r.decision, "pass");
+  assert.ok(r.reasonCodes.includes(REASON.OK_PREVIEW_PASS));
+  assert.deepEqual(previewReasonLines(r), [reasonText(REASON.OK_PREVIEW_PASS)]);
+  const withHits = evaluateJob(passJob, filters, {}, {});
+  assert.ok(previewReasonLines(withHits).some((t) => t.includes("职位命中包含词")));
+});
+
+console.log("3) template + resume bind");
+test("render template ok", () => {
+  const rt = renderTemplate("你好{职位名称}", { title: "后端" });
+  assert.ok(rt.ok);
+  assert.equal(rt.text, "你好后端");
+});
+test("render template missing fails", () => {
+  assert.equal(renderTemplate("你好{职位名称}", {}).ok, false);
+});
+test("render template names invalid variable and correction", () => {
+  const rt = renderTemplate("你好{职位信息}", { title: "后端" });
+  assert.equal(rt.ok, false);
+  assert.ok(rt.reasonTexts[0].includes("模板变量填写错误，请检查，已阻止发送"));
+  assert.ok(rt.reasonTexts[0].includes("{职位信息}"));
+  assert.ok(rt.reasonTexts[0].includes("{职位名称}"));
+  assert.ok(rt.reasonTexts[0].includes("消息"));
+  const custom = renderTemplate("你好{职位}", { title: "后端" });
+  assert.equal(custom.ok, false);
+  assert.ok(custom.reasonTexts[0].includes("变量「{职位}」"));
+  assert.ok(!custom.reasonTexts[0].includes("变量「{职位信息}」"));
+});
+test("target no-new retry limit has a safe default and clamp", () => {
+  assert.equal(DEFAULT_TARGET_NO_NEW_RETRY_LIMIT, 5);
+  assert.equal(normalizeTargetNoNewRetryLimit(undefined), 5);
+  assert.equal(normalizeTargetNoNewRetryLimit(0), 1);
+  assert.equal(normalizeTargetNoNewRetryLimit(999), 50);
+  assert.equal(normalizeTargetNoNewRetryLimit("7"), 7);
+});
+test("pickResumeProfile priority", () => {
+  const resumes = {
+    defaultProfileId: "default",
+    profiles: [
+      { id: "default", name: "默认" },
+      { id: "ai", name: "AI" },
+      { id: "java", name: "Java" }
+    ]
+  };
+  const bindings = {
+    rules: [
+      { priority: 1, keywords: ["Java", "Spring"], profileId: "java" },
+      { priority: 0, keywords: ["LLM", "Agent"], profileId: "ai" }
+    ]
+  };
+  assert.equal(pickResumeProfile({ title: "Java Agent", jd: "LLM" }, resumes, bindings).id, "ai");
+  assert.equal(pickResumeProfile({ title: "Java 后端", jd: "Spring" }, resumes, bindings).id, "java");
+  assert.equal(pickResumeProfile({ title: "产品", jd: "" }, resumes, bindings).id, "default");
+});
+
+console.log("4) message planner");
+test("successful idempotency key is not planned twice", () => {
+  const job = { jobId: "j9", bossId: "b9", title: "Java" };
+  const template = {
+    version: 3,
+    segments: [
+      { id: "1", enabled: true, text: "第一段" },
+      { id: "2", enabled: true, text: "第二段" }
+    ]
+  };
+  const first = planMessageSegments({
+    mode: MESSAGE_MODES.PLUGIN_ONLY,
+    template,
+    job,
+    recentSelfMessages: []
+  });
+  assert.equal(first.plan.length, 2);
+  const sentKey = first.plan[0].key;
+  const retry = planMessageSegments({
+    mode: MESSAGE_MODES.PLUGIN_ONLY,
+    template,
+    job,
+    recentSelfMessages: [],
+    idempotency: { [sentKey]: { ts: Date.now() } }
+  });
+  assert.equal(retry.plan.length, 1);
+  assert.equal(retry.plan[0].index, 1);
+  assert.notEqual(retry.plan[0].key, sentKey);
+});
+
+test("native_plus skips the first enabled segment", () => {
+  const plan = planMessageSegments({
+    mode: MESSAGE_MODES.NATIVE_PLUS,
+    template: {
+      version: 1,
+      segments: [
+        { id: "1", enabled: true, text: "第一段打招呼" },
+        { id: "2", enabled: true, text: "第二段补充" }
+      ]
+    },
+    job: { jobId: "n1", bossId: "b", title: "Java" },
+    recentSelfMessages: []
+  });
+  assert.equal(plan.startIndex, 1);
+  assert.equal(plan.plan.length, 1);
+  assert.ok(plan.plan[0].text.includes("第二段"));
+});
+
+test("auto detect skips first segment", () => {
+  const plan = planMessageSegments({
+    mode: MESSAGE_MODES.AUTO_DETECT,
+    template: {
+      version: 1,
+      segments: [
+        { id: "1", enabled: true, text: "我对{职位名称}感兴趣" },
+        { id: "2", enabled: true, text: "补充经历" }
+      ]
+    },
+    job: { jobId: "1", bossId: "b", title: "Java" },
+    recentSelfMessages: ["我对Java感兴趣"],
+    threshold: 0.85,
+    idempotency: {}
+  });
+  assert.equal(plan.startIndex, 1);
+  assert.equal(plan.plan.length, 1);
+});
+
+test("platform greeting receipt skips greeting roles but keeps supplements", () => {
+  const evidence = resolveNativeGreetingEvidence({
+    platformReceipt: { showGreeting: true, text: "平台实际发送的话术，与插件模板不同" },
+    settingSnapshot: { enabled: false }
+  });
+  assert.equal(evidence.state, NATIVE_GREETING_STATES.SENT);
+  assert.equal(evidence.source, "friend_add_receipt");
+  const plan = planMessageSegments({
+    mode: MESSAGE_MODES.AUTO_DETECT,
+    template: {
+      version: 4,
+      segments: [
+        { id: "hello", kind: MESSAGE_SEGMENT_KINDS.GREETING, enabled: true, text: "插件招呼" },
+        { id: "extra", kind: MESSAGE_SEGMENT_KINDS.SUPPLEMENT, enabled: true, text: "插件补充" }
+      ]
+    },
+    job: { jobId: "receipt-1", bossId: "boss-1" },
+    nativeGreetingState: evidence.state
+  });
+  assert.equal(plan.nativeDetected, true);
+  assert.deepEqual(plan.plan.map((step) => step.kind), [MESSAGE_SEGMENT_KINDS.SUPPLEMENT]);
+  assert.equal(plan.plan[0].text, "插件补充");
+});
+
+test("explicit no-greeting receipt sends greeting and supplement roles", () => {
+  const evidence = resolveNativeGreetingEvidence({
+    platformReceipt: { showGreeting: false },
+    settingSnapshot: { enabled: true }
+  });
+  assert.equal(evidence.state, NATIVE_GREETING_STATES.NOT_SENT);
+  const plan = planMessageSegments({
+    template: {
+      version: 1,
+      segments: [
+        { id: "hello", kind: "greeting", enabled: true, text: "你好" },
+        { id: "extra", kind: "supplement", enabled: true, text: "补充" }
+      ]
+    },
+    job: { jobId: "receipt-2" },
+    nativeGreetingState: evidence.state
+  });
+  assert.deepEqual(plan.plan.map((step) => step.text), ["你好", "补充"]);
+});
+
+test("fresh own bubble is accepted independently of template similarity", () => {
+  const evidence = resolveNativeGreetingEvidence({
+    settingSnapshot: { enabled: false },
+    freshSelfMessages: ["系统自动发送了一段完全不同的内容"]
+  });
+  assert.equal(evidence.state, NATIVE_GREETING_STATES.SENT);
+  assert.equal(evidence.source, "fresh_self_message");
+});
+
+test("unknown native greeting blocks templates containing a greeting role", () => {
+  const plan = planMessageSegments({
+    template: { version: 1, segments: [{ id: "hello", kind: "greeting", enabled: true, text: "你好" }] },
+    job: { jobId: "unknown-1" },
+    nativeGreetingState: NATIVE_GREETING_STATES.UNKNOWN,
+    strictUnknown: true
+  });
+  assert.equal(plan.blocked, true);
+  assert.equal(plan.blockReason, "NATIVE_GREETING_UNKNOWN");
+  assert.equal(plan.plan.length, 0);
+});
+
+test("unknown greeting state still permits supplements-only templates", () => {
+  const plan = planMessageSegments({
+    template: { version: 1, segments: [{ id: "extra", kind: "supplement", enabled: true, text: "补充" }] },
+    job: { jobId: "unknown-2" },
+    nativeGreetingState: NATIVE_GREETING_STATES.UNKNOWN,
+    strictUnknown: true
+  });
+  assert.equal(plan.blocked, false);
+  assert.equal(plan.plan.length, 1);
+});
+
+test("legacy templates migrate first segment to greeting and the rest to supplements", () => {
+  const migrated = normalizeMessageTemplateRoles({
+    version: 2,
+    segments: [{ id: "old-1", text: "第一段" }, { id: "old-2", text: "第二段" }]
+  });
+  assert.deepEqual(migrated.segments.map((segment) => segment.kind), ["greeting", "supplement"]);
+});
+
+test("plugin text master switch suppresses every plugin segment", () => {
+  const plan = planMessageSegments({
+    template: { version: 1, segments: [{ id: "hello", kind: "greeting", text: "你好" }] },
+    job: { jobId: "off-1" },
+    nativeGreetingState: NATIVE_GREETING_STATES.NOT_SENT,
+    pluginTextEnabled: false
+  });
+  assert.equal(plan.blocked, false);
+  assert.equal(plan.plan.length, 0);
+});
+
+test("disabled native greeting friend-add receipt recovers direct chat navigation", () => {
+  const recovered = resolveTriggerNavigationRecovery({
+    opType: "BHT_TRIGGER_CONVERSATION",
+    job: { jobId: "job-1", title: "AI 应用工程师", company: "华为技术有限公司" },
+    inflightAt: 1000,
+    now: 1600,
+    click: { at: 1300, jobId: "job-1", buttonText: "立即沟通", already: false, hrName: "李先生" },
+    receipt: { at: 1500, jobId: "job-1", ok: true, hasShowGreeting: true, showGreeting: false, greeting: "" },
+    href: "https://www.zhipin.com/web/geek/jobs",
+    contentVersion: "test"
+  });
+  assert.equal(recovered.ok, true);
+  assert.equal(recovered.navigationRecovered, true);
+  assert.equal(recovered.phase, "CHAT_TRIGGERED");
+  assert.equal(recovered.nativeGreeting.showGreeting, false);
+  assert.equal(recovered.hrName, "李先生");
+});
+
+test("navigation without friend-add confirmation is not treated as a created conversation", () => {
+  const unconfirmed = resolveTriggerNavigationRecovery({
+    opType: "BHT_TRIGGER_CONVERSATION",
+    job: { jobId: "job-2" },
+    inflightAt: 1000,
+    now: 1500,
+    click: { at: 1300, jobId: "job-2", buttonText: "立即沟通", already: false },
+    receipt: null,
+    href: "https://www.zhipin.com/web/geek/jobs"
+  });
+  assert.equal(unconfirmed, null);
+});
+
+test("continue-chat navigation is recoverable without a new friend-add receipt", () => {
+  const recovered = resolveTriggerNavigationRecovery({
+    opType: "BHT_TRIGGER_CONVERSATION",
+    job: { jobId: "job-3" },
+    inflightAt: 1000,
+    now: 1500,
+    click: { at: 1300, jobId: "job-3", buttonText: "继续沟通", already: true },
+    receipt: null,
+    href: "https://www.zhipin.com/web/geek/jobs"
+  });
+  assert.equal(recovered.ok, true);
+  assert.equal(recovered.already, true);
+  assert.equal(recovered.nativeGreeting.source, "already-contacted");
+});
+
+test("runtime logs are deduplicated and sorted by numeric timestamps", () => {
+  const logs = [
+    { id: "middle", ts: 200, message: "middle" },
+    { id: "old", ts: 100, message: "old" },
+    { id: "new", ts: 300, message: "new" },
+    { id: "new", ts: 300, message: "duplicate" }
+  ];
+  assert.deepEqual(sortLogsNewestFirst(logs).map((entry) => entry.id), ["new", "middle", "old"]);
+  assert.deepEqual(sortLogsOldestFirst(logs).map((entry) => entry.id), ["old", "middle", "new"]);
+  assert.deepEqual(
+    mergeRuntimeLog(logs, { id: "latest", ts: 400, message: "latest" }, 3).map((entry) => entry.id),
+    ["latest", "new", "middle"]
+  );
+});
+
+test("runtime log timestamps include the calendar date", () => {
+  const formatted = formatLogTimestamp(new Date(2026, 7, 21, 9, 8, 7).getTime());
+  assert.equal(formatted, "08-21 09:08:07");
+});
+
+test("resume images are deduplicated by content", () => {
+  const imageA = { name: "resume.png", dataUrl: "data:image/png;base64,AAA" };
+  const imageB = { name: "resume-2.png", dataUrl: "data:image/png;base64,BBB" };
+  assert.deepEqual(dedupeResumeImages([imageA, { ...imageA }, imageB]), [imageA, imageB]);
+  const merged = mergeResumeImages([imageA, { ...imageA }], [{ ...imageA }]);
+  assert.equal(merged.images.length, 1);
+  assert.equal(merged.added, 0);
+  assert.equal(merged.duplicates, 2);
+  const resumes = normalizeResumes({
+    profiles: [{
+      id: "default",
+      images: [imageA, { ...imageA }],
+      attachment: { name: "legacy.pdf", dataUrl: "data:application/pdf;base64,OLD" }
+    }]
+  });
+  assert.equal(resumes.profiles[0].images.length, 1);
+  assert.equal(resumes.profiles[0].attachment.name, "legacy.pdf");
+});
+
+console.log("5) dedup + limits");
+test("task max limit", () => {
+  assert.equal(
+    checkLimits({
+      settings: { taskMaxCommunicate: 2, dailyMaxCommunicate: 10 },
+      taskSuccessCount: 2,
+      todayStats: { communicate: 1 }
+    }).ok,
+    false
+  );
+});
+test("session exists dedup", () => {
+  assert.equal(
+    checkDedup(
+      { jobId: "x", bossId: "b", company: "C", title: "T", communicated: true },
+      {
+        settings: { neverRepeatJob: true, bossCooldownDays: 30, companyDailyMax: 3 },
+        history: [],
+        todayStats: { byCompany: {} },
+        taskItemKeys: new Set(),
+        idempotency: {}
+      }
+    ).ok,
+    false
+  );
+});
+test("confirmed platform job-switch dialog prevents another job for that HR during cooldown", () => {
+  const job = { jobId: "new-job", bossId: "same-hr", company: "C", title: "T" };
+  const context = {
+    settings: { neverRepeatJob: true, bossCooldownDays: 30, companyDailyMax: 3 },
+    history: [{
+      jobId: "other-job", bossId: "same-hr", status: "skipped_list",
+      reason: "BOSS_JOB_SWITCH_REQUIRED", ts: Date.now()
+    }]
+  };
+  assert.deepEqual(checkDedup(job, context).reasonCodes, [REASON.DEDUP_BOSS]);
+  assert.equal(checkDedup({ ...job, bossId: "different-hr" }, context).ok, true);
+  assert.equal(checkDedup(job, { ...context, history: [{ ...context.history[0], reason: "NON_CHAT_JOB" }] }).ok, true);
+  assert.equal(checkDedup(job, {
+    ...context, history: [{ ...context.history[0], ts: Date.now() - 31 * 86400000 }]
+  }).ok, true);
+  assert.equal(checkDedup(job, {
+    ...context, settings: { ...context.settings, bossCooldownDays: 0 }
+  }).ok, true);
+});
+test("idempotency key stable", () => {
+  const k = segmentIdempotencyKey({ jobId: "j1", bossId: "b1" }, 1, 0);
+  assert.ok(k.includes("j1"));
+  assert.ok(jobIdempotencyKey({ jobId: "j1" }).includes("j1"));
+});
+test("saved settings drive limits and never-repeat", () => {
+  const settings = {
+    taskMaxCommunicate: 1,
+    dailyMaxCommunicate: 2,
+    neverRepeatJob: true,
+    bossCooldownDays: 0,
+    companyDailyMax: 0
+  };
+  assert.equal(checkLimits({ settings, taskSuccessCount: 1, todayStats: { communicate: 0 } }).ok, false);
+  assert.ok(
+    checkLimits({ settings, taskSuccessCount: 0, todayStats: { communicate: 2 } }).reasonCodes.includes("LIMIT_DAILY_MAX")
+  );
+  const dedup = checkDedup(
+    { jobId: "job-1", bossId: "b", company: "C", title: "T" },
+    {
+      settings,
+      history: [{ jobId: "job-1", status: "success", ts: Date.now() }],
+      todayStats: { byCompany: {} },
+      taskItemKeys: new Set(),
+      idempotency: {}
+    }
+  );
+  assert.equal(dedup.ok, false);
+  assert.ok(dedup.reasonCodes.includes("DEDUP_JOB"));
+});
+
+console.log("5b) history + resume policy + config io");
+test("history filter keeps only matching status classes", () => {
+  const rows = [
+    { status: "success", title: "A" },
+    { status: "skipped_list", title: "B" },
+    { status: "conversation_not_found", title: "C" },
+    { status: "failed", title: "D" }
+  ];
+  assert.equal(filterHistoryRows(rows, "all").length, 4);
+  assert.deepEqual(filterHistoryRows(rows, "success").map((r) => r.title), ["A"]);
+  assert.deepEqual(filterHistoryRows(rows, "skipped").map((r) => r.title), ["B", "C"]);
+  assert.deepEqual(filterHistoryRows(rows, "failed").map((r) => r.title), ["D"]);
+});
+test("image resume requires images and after_text while legacy platform setting is ignored", () => {
+  const enabled = planResumeSend({
+    settings: { autoSendImageResume: true, resumeSendTiming: "after_text" },
+    hasImages: true
+  });
+  assert.equal(enabled.wantAutoImage, true);
+  assert.equal(enabled.doResume, true);
+  assert.equal("wantPlatformResume" in enabled, false);
+  const legacyOnly = planResumeSend({
+    settings: { autoSendAttachmentResume: true, autoSendImageResume: false, resumeSendTiming: "after_text" },
+    hasImages: false
+  });
+  assert.equal(legacyOnly.wantAutoImage, false);
+  assert.equal(legacyOnly.doResume, false);
+  const manual = planResumeSend({
+    settings: { autoSendAttachmentResume: true, autoSendImageResume: true, resumeSendTiming: "manual" },
+    hasImages: true
+  });
+  assert.equal(manual.doResume, false);
+  assert.equal("wantPlatformResume" in manual, false);
+  assert.equal(normalizeSettings({ autoSendAttachmentResume: true }).autoSendAttachmentResume, undefined);
+});
+test("export payload round-trips settings filters template and bindings", () => {
+  const now = new Date("2026-08-14T00:00:00.000Z");
+  const all = {
+    settings: { taskMaxCommunicate: 7, messageMode: "plugin_only", neverRepeatJob: false, autoSendAttachmentResume: true },
+    filters: { title: { or: ["Java"] } },
+    messageTemplate: { version: 2, segments: [{ id: "s1", text: "hi", enabled: true }] },
+    bindings: { rules: [{ keywords: ["Java"], profileId: "java", priority: 0 }] },
+    resumes: { defaultProfileId: "java", profiles: [{ id: "java" }] },
+    lists: { companyBlacklist: ["x"] },
+    history: [{ status: "success", title: "T" }],
+    logs: new Array(120).fill({ message: "x" })
+  };
+  const exported = buildExportPayload(all, now);
+  assert.equal(exported.version, 1);
+  assert.equal(exported.exportedAt, now.toISOString());
+  assert.equal(exported.settings.taskMaxCommunicate, 7);
+  assert.equal(exported.settings.autoSendAttachmentResume, undefined);
+  assert.equal(exported.filters.title.or[0], "Java");
+  assert.equal(exported.messageTemplate.version, 2);
+  assert.equal(exported.bindings.rules[0].profileId, "java");
+  assert.equal(exported.logs.length, 100);
+  const patch = importConfigPatch(exported);
+  assert.deepEqual(patch[STORAGE_KEYS.SETTINGS], exported.settings);
+  assert.deepEqual(patch[STORAGE_KEYS.FILTERS], exported.filters);
+  assert.deepEqual(patch[STORAGE_KEYS.MESSAGE_TEMPLATE], exported.messageTemplate);
+  assert.deepEqual(patch[STORAGE_KEYS.BINDINGS], exported.bindings);
+  assert.equal(Object.keys(IMPORT_CONFIG_KEYS).includes("settings"), true);
+});
+
+test("settings patches serialize and preserve concurrent keys", async () => {
+  const previousChrome = globalThis.chrome;
+  const stored = { [STORAGE_KEYS.SETTINGS]: { theme: "dark", taskMaxCommunicate: 30 } };
+  globalThis.chrome = {
+    storage: {
+      local: {
+        get: async (key) => ({ [key]: structuredClone(stored[key]) }),
+        set: async (patch) => {
+          for (const [key, value] of Object.entries(patch)) stored[key] = structuredClone(value);
+        }
+      }
+    }
+  };
+  try {
+    await Promise.all([
+      saveSettings({ theme: "light" }),
+      saveSettings({ taskMaxCommunicate: 42 })
+    ]);
+    assert.equal(stored[STORAGE_KEYS.SETTINGS].theme, "light");
+    assert.equal(stored[STORAGE_KEYS.SETTINGS].taskMaxCommunicate, 42);
+  } finally {
+    globalThis.chrome = previousChrome;
+  }
+});
+
+test("legacy filters migrate on read, save, import and export without changing OR/NOT", async () => {
+  const legacy = structuredClone(filters);
+  for (const field of ["title", "company", "jd"]) {
+    legacy[field].and = ["旧的必需词"];
+    legacy[field].enabled = { or: false, not: true, and: true };
+  }
+  const original = structuredClone(legacy);
+  const normalized = normalizeFilters(legacy);
+  const check = (value) => {
+    for (const field of ["title", "company", "jd"]) {
+      assert.ok(!("and" in value[field]));
+      assert.ok(!("and" in value[field].enabled));
+      assert.deepEqual(value[field].or, original[field].or);
+      assert.deepEqual(value[field].not, original[field].not);
+      assert.equal(value[field].enabled.or, false);
+      assert.equal(value[field].enabled.not, true);
+    }
+    assert.deepEqual(value.location, {
+      ...original.location,
+      enabled: { include: true, exclude: true, ...original.location.enabled }
+    });
+    assert.equal(value.salaryMin, original.salaryMin);
+  };
+  check(normalized);
+  check(importConfigPatch({ filters: legacy })[STORAGE_KEYS.FILTERS]);
+  check(buildExportPayload({ filters: legacy }).filters);
+  assert.deepEqual(legacy, original, "migration must not mutate the input");
+  const previousChrome = globalThis.chrome;
+  const stored = { [STORAGE_KEYS.FILTERS]: structuredClone(legacy) };
+  globalThis.chrome = { storage: { local: {
+    get: async (keys) => Object.fromEntries((Array.isArray(keys) ? keys : [keys])
+      .map((key) => [key, structuredClone(stored[key])])),
+    set: async (patch) => {
+      for (const [key, value] of Object.entries(patch)) stored[key] = structuredClone(value);
+    }
+  } } };
+  try {
+    check((await getAllConfig()).filters);
+    check(stored[STORAGE_KEYS.FILTERS]);
+    await saveFilters(legacy);
+    check(stored[STORAGE_KEYS.FILTERS]);
+  } finally {
+    globalThis.chrome = previousChrome;
+  }
+});
+
+test("export carries daily stats, idempotency and task; import sanitizes task", () => {
+  const all = {
+    settings: { dailyMaxCommunicate: 150, taskMaxCommunicate: 1 },
+    filters: { activeWithin: ["week"] },
+    dailyStats: { "2026-09-02": { communicate: 5, success: 5, skip: 0, fail: 0, byCompany: {} } },
+    idempotency: { "job:abc": { ts: 1, phase: "triggered" } },
+    task: {
+      id: "task_x", status: "running", results: [{ decision: "pass", job: { jobId: "a", title: "T", href: "h" } }],
+      queue: [], items: [], execution: { listTabId: 7, workerTabId: 9 }, previewRunId: "p1", consecutiveFails: 3
+    },
+    history: [{ status: "success", title: "T1" }],
+    logs: []
+  };
+  const exported = buildExportPayload(all, new Date("2026-09-02T10:00:00Z"));
+  assert.equal(exported.dailyStats["2026-09-02"].communicate, 5, "daily stats exported");
+  assert.equal(exported.idempotency["job:abc"].phase, "triggered", "idempotency exported");
+  assert.equal(exported.task.status, "running", "task exported");
+
+  const patch = importConfigPatch(exported);
+  assert.equal(patch[STORAGE_KEYS.DAILY_STATS]["2026-09-02"].communicate, 5, "daily stats restored");
+  assert.equal(patch[STORAGE_KEYS.IDEMPOTENCY]["job:abc"].phase, "triggered", "idempotency restored");
+  // 任务导入必须安全化：绝不以 running 状态进入，运行时痕迹清空
+  const importedTask = patch[STORAGE_KEYS.TASK];
+  assert.ok(importedTask, "task imported when it has results");
+  assert.equal(importedTask.status, "awaiting_confirm", "running task downgraded to awaiting_confirm");
+  assert.deepEqual(importedTask.execution, {}, "execution traces cleared");
+  assert.equal(importedTask.previewRunId, null);
+  assert.equal(importedTask.consecutiveFails, 0);
+  assert.equal(importedTask.completionSignal, null);
+
+  // 无预览数据的任务不导入
+  const noResults = importConfigPatch({ task: { id: "bad", status: "running", results: [] } });
+  assert.equal(noResults[STORAGE_KEYS.TASK], undefined, "task without results skipped");
+  assert.ok(!Object.keys(noResults).includes(STORAGE_KEYS.TASK), "no task key written for empty task");
+  assert.equal(sanitizeImportedTask(null), null);
+  assert.equal(sanitizeImportedTask({ results: [] }), null);
+  // 非法类型防护
+  assert.throws(() => importConfigPatch({ dailyStats: [1, 2], idempotency: "x" }), /dailyStats/);
+  assert.throws(() => importConfigPatch({ idempotency: "x" }), /idempotency/);
+});
+
+test("allowRepublishedJob escape also applies to idempotency book", () => {
+  const settings = { neverRepeatJob: true, allowRepublishedJob: true, bossCooldownDays: 30, companyDailyMax: 0 };
+  const baseCtx = (idemEntry, jobSecurityId) => ({
+    settings, history: [], idempotency: { "job:abc": idemEntry }, job: { jobId: "abc", bossId: "b1", securityId: jobSecurityId }
+  });
+  // 同一 securityId：幂等命中 → 拦（原漏洞已修：不再无条件放行）
+  const same = checkDedup({ jobId: "abc", bossId: "b1", securityId: "S1" }, baseCtx({ securityId: "S1" }, "S1"));
+  assert.equal(same.reasonCodes.includes(REASON.DEDUP_JOB), true, "same securityId still blocked");
+  // 重发（securityId 变化）：应放行（S1 修复）
+  const republished = checkDedup({ jobId: "abc", bossId: "b1", securityId: "S2" }, baseCtx({ securityId: "S1" }, "S2"));
+  assert.equal(republished.reasonCodes.includes(REASON.DEDUP_JOB), false, "republished job allowed with allowRepublishedJob");
+  assert.equal(republished.ok, true, "republished job passes");
+  // allowRepublishedJob 关闭：幂等命中仍拦
+  const strict = checkDedup({ jobId: "abc", bossId: "b1", securityId: "S2" },
+    { settings: { ...settings, allowRepublishedJob: false }, history: [], idempotency: { "job:abc": { securityId: "S1" } } });
+  assert.equal(strict.reasonCodes.includes(REASON.DEDUP_JOB), true, "strict mode blocks republished");
+  // 无 jobId 岗：按 jobIdempotencyKey 键复核（M6）
+  const noJobId = checkDedup({ jobId: "", bossId: "b1", company: "甲公司", title: "岗位T", securityId: "S1" },
+    { settings: { neverRepeatJob: true, allowRepublishedJob: false, bossCooldownDays: 30, companyDailyMax: 0 }, history: [], idempotency: { ["job:甲公司|岗位t"]: { securityId: "S1" } } });
+  assert.equal(noJobId.reasonCodes.includes(REASON.DEDUP_JOB), true, "no-jobId job checked via key fallback");
+  // P1 兼容：旧版本幂等记录没有 securityId，回退用同岗 history 成功记录的 securityId 作为重发证据
+  const legacyCtx = (historyRows, idemEntry) => ({
+    settings: { ...settings, allowRepublishedJob: true, neverRepeatJob: true },
+    history: historyRows, idempotency: { "job:abc": idemEntry }
+  });
+  const legacyAllowed = checkDedup({ jobId: "abc", bossId: "b1", securityId: "S2" },
+    legacyCtx([{ jobId: "abc", status: "success", securityId: "S1" }], { ts: 1, jobId: "abc" }));
+  assert.equal(legacyAllowed.ok, true, "legacy idem entry falls back to history securityId for republish");
+  const legacySame = checkDedup({ jobId: "abc", bossId: "b1", securityId: "S1" },
+    legacyCtx([{ jobId: "abc", status: "success", securityId: "S1" }], { ts: 1, jobId: "abc" }));
+  assert.equal(legacySame.reasonCodes.includes(REASON.DEDUP_JOB), true, "legacy entry + same securityId blocked");
+  const legacyNoEvidence = checkDedup({ jobId: "abc", bossId: "b1", securityId: "S2" },
+    legacyCtx([], { ts: 1, jobId: "abc" }));
+  assert.equal(legacyNoEvidence.reasonCodes.includes(REASON.DEDUP_JOB), true, "no securityId evidence blocks republish");
+  // 终审 P3：history 成功行缺 securityId（旧数据）时，回退用幂等簿条目的 securityId 作重发证据
+  const hitNoSid = checkDedup({ jobId: "abc", bossId: "b1", securityId: "S2" },
+    legacyCtx([{ jobId: "abc", status: "success" }], { ts: 1, securityId: "S1" }));
+  assert.equal(hitNoSid.ok, true, "history row without securityId falls back to idem entry securityId");
+  const hitNoSidSame = checkDedup({ jobId: "abc", bossId: "b1", securityId: "S1" },
+    legacyCtx([{ jobId: "abc", status: "success" }], { ts: 1, securityId: "S1" }));
+  assert.equal(hitNoSidSame.reasonCodes.includes(REASON.DEDUP_JOB), true, "fallback evidence still blocks same securityId");
+  // 证据分歧（history=S1、幂等簿=S2、新岗=S2）：任一来源相同即拦（绝不重复优先）
+  const divergent = checkDedup({ jobId: "abc", bossId: "b1", securityId: "S2" },
+    legacyCtx([{ jobId: "abc", status: "success", securityId: "S1" }], { ts: 1, securityId: "S2" }));
+  assert.equal(divergent.reasonCodes.includes(REASON.DEDUP_JOB), true, "any matching evidence blocks republish");
+});
+
+test("checkLimits treats dailyMaxCommunicate 0 as unlimited", () => {
+  const ok = checkLimits({ settings: { taskMaxCommunicate: 5, dailyMaxCommunicate: 0 }, taskSuccessCount: 1, todayStats: { communicate: 999 } });
+  assert.equal(ok.ok, true, "0 daily max means no daily limit");
+  const limited = checkLimits({ settings: { taskMaxCommunicate: 5, dailyMaxCommunicate: 3 }, taskSuccessCount: 1, todayStats: { communicate: 3 } });
+  assert.equal(limited.ok, false, "communicate >= positive limit blocks");
+  assert.equal(limited.reasonCodes.includes(REASON.LIMIT_DAILY_MAX), true);
+});
+
+test("history import guards and unknown-status summary", () => {
+  assert.throws(() => importConfigPatch({ history: "not-array", dailyStats: [1], idempotency: "x" }), /history/);
+  const big = importConfigPatch({ history: new Array(6000).fill({ status: "success" }) });
+  assert.equal(big[STORAGE_KEYS.HISTORY].length, 5000, "history capped to 5000");
+  // unknown status 归类与列表一致（计跳过）
+  const s = summarizeHistory([{ status: "success" }, { status: "whatever-new" }, { status: "failed" }]);
+  assert.deepEqual(s, { total: 3, success: 1, skipped: 1, failed: 1 }, "unknown status counts as skipped like the list");
+});
+
+test("sanitizeImportedTask resets run counters", () => {
+  const t = sanitizeImportedTask({ id: "x", results: [{ decision: "pass", job: { jobId: "a" } }], counters: { success: 9, skipped: 2, failed: 1, processed: 12 }, status: "paused", execution: { listTabId: 1 } });
+  assert.ok(t, "task imported");
+  assert.deepEqual(t.counters, { success: 0, skipped: 0, failed: 0, processed: 0 }, "counters reset for re-run");
+  assert.equal(t.status, "awaiting_confirm");
+});
+
+test("history date filter boundaries and summary", () => {
+  const day = new Date("2026-09-02T12:00:00");
+  const rows = [
+    { id: "a", ts: new Date("2026-09-01T23:59:59").getTime(), status: "success", title: "before" },
+    { id: "b", ts: new Date("2026-09-02T00:00:00").getTime(), status: "success", title: "boundary-from" },
+    { id: "c", ts: new Date("2026-09-02T23:59:59").getTime(), status: "skipped_list", title: "boundary-to" },
+    { id: "d", ts: new Date("2026-09-03T00:00:00").getTime(), status: "failed", title: "after" }
+  ];
+  const from = new Date("2026-09-02T00:00:00");
+  const to = new Date("2026-09-02T00:00:00");
+  const inDay = filterHistoryByDate(rows, from.getTime(), to.getTime());
+  assert.deepEqual(inDay.map((r) => r.id), ["b", "c"], "local-day boundaries inclusive");
+  assert.equal(filterHistoryByDate(rows, 0, 0).length, 4, "no range returns all");
+  assert.equal(filterHistoryByDate(rows, 0, new Date("2026-09-02T12:00:00").getTime()).length, 3, "only end bound");
+  assert.equal(startOfLocalDay(day.getTime()) < day.getTime(), true, "startOfLocalDay before noon");
+  assert.ok(endOfLocalDay(day.getTime()) > day.getTime(), "endOfLocalDay after noon");
+  const s = summarizeHistory(rows);
+  assert.deepEqual(s, { total: 4, success: 2, skipped: 1, failed: 1 });
+  assert.deepEqual(summarizeHistory([]), { total: 0, success: 0, skipped: 0, failed: 0 });
+});
+
+test("normalizeHistoryDateRange fixes inverted date range", () => {
+  // 正常范围不变
+  assert.deepEqual(normalizeHistoryDateRange("2026-09-01", "2026-09-10"), { fromVal: "2026-09-01", toVal: "2026-09-10", adjusted: false });
+  // 起止同一天
+  assert.deepEqual(normalizeHistoryDateRange("2026-09-05", "2026-09-05"), { fromVal: "2026-09-05", toVal: "2026-09-05", adjusted: false });
+  // 结束早于开始：修正为开始日期当天
+  assert.deepEqual(normalizeHistoryDateRange("2026-09-10", "2026-09-01"), { fromVal: "2026-09-10", toVal: "2026-09-10", adjusted: true });
+  // 单边为空不受影响
+  assert.deepEqual(normalizeHistoryDateRange("2026-09-10", ""), { fromVal: "2026-09-10", toVal: "", adjusted: false });
+  assert.deepEqual(normalizeHistoryDateRange("", "2026-09-01"), { fromVal: "", toVal: "2026-09-01", adjusted: false });
+  assert.deepEqual(normalizeHistoryDateRange("", ""), { fromVal: "", toVal: "", adjusted: false });
+});
+
+console.log("5c) delivery schedule");
+const scheduledWeekdays = {
+  scheduledDeliveryEnabled: true,
+  scheduledDeliveryDays: [1, 2, 3, 4, 5]
+};
+test("delivery schedule uses the two fixed weekday windows", () => {
+  assert.deepEqual(DELIVERY_SCHEDULE_WINDOWS.map((window) => window.label), ["09:00-12:00", "14:00-17:00"]);
+  const monday = (hour, minute) => new Date(2026, 8, 7, hour, minute, 0, 0);
+  assert.equal(monday(8, 59).getDay(), 1);
+  assert.equal(evaluateDeliverySchedule(scheduledWeekdays, monday(8, 59)).allowed, false);
+  assert.equal(evaluateDeliverySchedule(scheduledWeekdays, monday(9, 0)).allowed, true);
+  assert.equal(evaluateDeliverySchedule(scheduledWeekdays, monday(11, 59)).allowed, true);
+  assert.equal(evaluateDeliverySchedule(scheduledWeekdays, monday(12, 0)).allowed, false);
+  assert.equal(evaluateDeliverySchedule(scheduledWeekdays, monday(14, 0)).allowed, true);
+  assert.equal(evaluateDeliverySchedule(scheduledWeekdays, monday(16, 59)).allowed, true);
+  assert.equal(evaluateDeliverySchedule(scheduledWeekdays, monday(17, 0)).allowed, false);
+});
+test("delivery schedule stays closed on weekends and honors custom days", () => {
+  const saturday = new Date(2026, 8, 12, 10, 0, 0, 0);
+  assert.equal(saturday.getDay(), 6);
+  assert.equal(evaluateDeliverySchedule(scheduledWeekdays, saturday).allowed, false);
+  assert.equal(evaluateDeliverySchedule({ ...scheduledWeekdays, scheduledDeliveryDays: [6] }, saturday).allowed, true);
+  assert.equal(evaluateDeliverySchedule({ scheduledDeliveryEnabled: false }, saturday).allowed, true);
+});
+test("delivery schedule computes the next weekday start", () => {
+  const mondayNoon = new Date(2026, 8, 7, 12, 0, 0, 0);
+  const afternoon = nextDeliveryScheduleStart(scheduledWeekdays, mondayNoon);
+  assert.equal(afternoon?.getDay(), 1);
+  assert.equal(afternoon?.getHours(), 14);
+  assert.equal(afternoon?.getMinutes(), 0);
+  const fridayClose = new Date(2026, 8, 11, 17, 0, 0, 0);
+  const next = nextDeliveryScheduleStart(scheduledWeekdays, fridayClose);
+  assert.equal(next?.getDay(), 1);
+  assert.equal(next?.getHours(), 9);
+  assert.equal(next?.getMinutes(), 0);
+  assert.ok(formatDeliveryScheduleStatus(scheduledWeekdays, fridayClose).includes("周一 09:00"));
+});
+test("delivery schedule settings normalize imported day values", () => {
+  assert.deepEqual(normalizeDeliveryScheduleDays([5, "1", 5, -1, 8]), [1, 5]);
+  assert.deepEqual(normalizeSettings({}).scheduledDeliveryDays, [1, 2, 3, 4, 5]);
+  assert.equal(normalizeSettings({ scheduledDeliveryEnabled: 1 }).scheduledDeliveryEnabled, false);
+  const noDays = { scheduledDeliveryEnabled: true, scheduledDeliveryDays: [] };
+  assert.equal(evaluateDeliverySchedule(noDays, new Date(2026, 8, 7, 10, 0, 0, 0)).allowed, false);
+  assert.equal(nextDeliveryScheduleStart(noDays, new Date(2026, 8, 7, 10, 0, 0, 0)), null);
+  assert.ok(formatDeliveryScheduleStatus(noDays).includes("未选择运行日"));
+});
+test("default delivery interval is about 30 seconds", () => {
+  const settings = normalizeSettings({});
+  assert.deepEqual(settings.jobIntervalMs, [29000, 31000]);
+});
+test("delivery schedule honors custom windows", () => {
+  const custom = { ...scheduledWeekdays, scheduledDeliveryWindows: [{ start: '10:00', end: '14:00' }] };
+  const monday = (hour, minute) => new Date(2026, 8, 7, hour, minute, 0, 0);
+  assert.equal(monday(9, 59).getDay(), 1);
+  assert.equal(evaluateDeliverySchedule(custom, monday(9, 59)).allowed, false);
+  assert.equal(evaluateDeliverySchedule(custom, monday(10, 0)).allowed, true);
+  assert.equal(evaluateDeliverySchedule(custom, monday(13, 59)).allowed, true);
+  assert.equal(evaluateDeliverySchedule(custom, monday(14, 0)).allowed, false);
+  assert.ok(formatDeliveryScheduleStatus(custom, monday(11, 0)).includes("当前可投递 · 10:00-14:00"));
+  assert.ok(formatDeliveryScheduleStatus(custom, monday(14, 0)).includes("当前暂停 · 下次 周二 10:00"));
+  // 默认两个时段可通过显式设置覆盖
+  const both = { ...scheduledWeekdays, scheduledDeliveryWindows: [{ start: '08:30', end: '09:30' }, { start: '20:00', end: '21:00' }] };
+  assert.equal(evaluateDeliverySchedule(both, new Date(2026, 8, 7, 8, 0, 0, 0)).allowed, false);
+  assert.equal(evaluateDeliverySchedule(both, new Date(2026, 8, 7, 9, 0, 0, 0)).allowed, true);
+  assert.equal(evaluateDeliverySchedule(both, new Date(2026, 8, 7, 20, 30, 0, 0)).allowed, true);
+  assert.ok(formatDeliveryScheduleStatus(both, new Date(2026, 8, 7, 9, 30, 0, 0)).includes("当前暂停 · 下次 周一 20:00"));
+});
+test("delivery schedule drops invalid windows and handles none", () => {
+  const mixed = {
+    ...scheduledWeekdays,
+    scheduledDeliveryWindows: [
+      { start: '09:00', end: '12:00' },
+      { start: '25:00', end: '26:00' },
+      { start: '14:00', end: '13:00' },
+      { start: '09:00', end: '12:00' }
+    ]
+  };
+  assert.deepEqual(normalizeDeliveryScheduleWindows(mixed.scheduledDeliveryWindows).map((w) => w.label), ["09:00-12:00"]);
+  const none = { ...scheduledWeekdays, scheduledDeliveryWindows: [] };
+  assert.equal(evaluateDeliverySchedule(none, new Date(2026, 8, 7, 10, 0, 0, 0)).allowed, false);
+  assert.equal(nextDeliveryScheduleStart(none, new Date(2026, 8, 7, 10, 0, 0, 0)), null);
+  assert.ok(formatDeliveryScheduleStatus(none).includes("未设置有效投递时段"));
+  // 缺失时回退默认两个时段
+  assert.deepEqual(normalizeDeliveryScheduleWindows(undefined).map((w) => w.label), ["09:00-12:00", "14:00-17:00"]);
+  assert.deepEqual(normalizeDeliveryScheduleWindows({ scheduledDeliveryWindows: undefined }).map((w) => w.label), ["09:00-12:00", "14:00-17:00"]);
+  assert.deepEqual(DEFAULT_DELIVERY_SCHEDULE_WINDOWS, [{ start: '09:00', end: '12:00' }, { start: '14:00', end: '17:00' }]);
+});
+test("delivery schedule settings normalize windows", () => {
+  assert.deepEqual(normalizeSettings({}).scheduledDeliveryWindows, [{ start: '09:00', end: '12:00' }, { start: '14:00', end: '17:00' }]);
+  const custom = normalizeSettings({ scheduledDeliveryWindows: [{ start: '08:00', end: '09:00' }, { start: '10:00', end: '11:00' }] });
+  assert.deepEqual(custom.scheduledDeliveryWindows, [{ start: '08:00', end: '09:00' }, { start: '10:00', end: '11:00' }]);
+  // 旧设置缺字段时补默认，不进默认值覆盖用户显式配置
+  const one = normalizeSettings({ scheduledDeliveryWindows: [{ start: '19:00', end: '23:00' }] });
+  assert.deepEqual(one.scheduledDeliveryWindows, [{ start: '19:00', end: '23:00' }]);
+});
+test("delivery schedule caps the number of windows at 10", () => {
+  const many = Array.from({ length: 12 }, (_, i) => ({
+    start: `${String(6 + i).padStart(2, '0')}:00`,
+    end: `${String(6 + i).padStart(2, '0')}:59`
+  }));
+  const normalized = normalizeDeliveryScheduleWindows(many);
+  assert.equal(normalized.length, 10);
+  assert.equal(normalized[0].label, '06:00-06:59');
+  assert.equal(normalized[9].label, '15:00-15:59');
+  const s = { scheduledDeliveryEnabled: true, scheduledDeliveryDays: [1, 2, 3, 4, 5], scheduledDeliveryWindows: many };
+  assert.equal(evaluateDeliverySchedule(s, new Date(2026, 8, 7, 16, 30, 0, 0)).allowed, false);
+  assert.equal(evaluateDeliverySchedule(s, new Date(2026, 8, 7, 15, 30, 0, 0)).activeWindow?.label, '15:00-15:59');
+});
+test("delivery schedule diagnoses duplicate invalid and overlapping windows", () => {
+  const rows = [
+    { start: '09:00', end: '12:00' },
+    { start: '09:00', end: '12:00' },
+    { start: '10:00', end: '13:00' },
+    { start: '25:00', end: '26:00' },
+    { start: '20:00', end: '19:00' },
+    { start: '20:00', end: '21:00' }
+  ];
+  const d = diagnoseDeliveryScheduleWindows(rows);
+  assert.deepEqual(d.map((x) => x.status), ['ok', 'duplicate', 'overlap', 'invalid', 'invalid', 'ok']);
+  assert.equal(d[1].ofIndex, 0);
+  assert.equal(d[2].ofIndex, 0);
+  assert.ok(d[1].reason.includes('完全相同'));
+  assert.ok(d[2].reason.includes('部分重叠'));
+  // 规范化结果与诊断一致：重复/非法被忽略，重叠保留取并集
+  const effective = normalizeDeliveryScheduleWindows(rows);
+  assert.deepEqual(effective.map((w) => w.label), ['09:00-12:00', '10:00-13:00', '20:00-21:00']);
+  // 全部合法时诊断全 ok
+  const clean = diagnoseDeliveryScheduleWindows([{ start: '08:00', end: '09:00' }, { start: '13:00', end: '14:00' }]);
+  assert.ok(clean.every((x) => x.status === 'ok'));
+  // 前面行无效时，重叠标注引用原始行号而不是有效列表下标
+  const afterInvalid = diagnoseDeliveryScheduleWindows([
+    { start: '12:00', end: '09:00' },
+    { start: '10:00', end: '13:00' },
+    { start: '09:00', end: '12:00' }
+  ]);
+  assert.equal(afterInvalid[2].status, 'overlap');
+  assert.equal(afterInvalid[2].ofIndex, 1);
+  assert.ok(afterInvalid[2].reason.includes('时段 2'));
+});
+
+console.log("6) boss-url guard");
+test("boss urls accepted", () => {
+  assert.equal(isBossUrl("https://www.zhipin.com/web/geek/jobs"), true);
+  assert.equal(isBossUrl("https://zhipin.com/"), true);
+  assert.equal(isBossUrl("https://m.zhipin.com/job"), true);
+  assert.equal(isBossUrl("https://www.bosszhipin.com/"), true);
+});
+test("non-boss rejected", () => {
+  assert.equal(isBossUrl("https://www.google.com/"), false);
+  assert.equal(isBossUrl("https://notzhipin.com/"), false);
+  assert.equal(isBossUrl("https://zhipin.com.evil.com/"), false);
+  assert.equal(isBossUrl("chrome://extensions"), false);
+  assert.equal(isBossUrl("about:blank"), false);
+  assert.equal(isBossUrl(""), false);
+});
+test("hostname helper", () => {
+  assert.equal(isBossHostname("www.zhipin.com"), true);
+  assert.equal(isBossHostname("evil.com"), false);
+});
+test("isBossTab", () => {
+  assert.equal(isBossTab({ id: 1, url: "https://www.zhipin.com/x" }), true);
+  assert.equal(isBossTab({ id: 1, url: "https://baidu.com" }), false);
+  assert.equal(isBossTab(null), false);
+});
+test("job list navigation preserves a safe saved search url", () => {
+  assert.equal(
+    resolveBossJobListUrl({
+      candidate: "https://www.zhipin.com/web/geek/jobs?query=AI%E5%BD%B1%E8%A7%86&city=101010100",
+      currentUrl: "https://www.zhipin.com/web/user/"
+    }),
+    "https://www.zhipin.com/web/geek/jobs?query=AI%E5%BD%B1%E8%A7%86&city=101010100"
+  );
+});
+test("job list navigation rejects non-list and non-BOSS targets", () => {
+  assert.equal(isBossJobListUrl("https://www.zhipin.com/web/user/"), false);
+  assert.equal(isBossJobListUrl("https://evil.example/web/geek/jobs"), false);
+  assert.equal(isBossJobListUrl("https://www.zhipin.com/job_detail/abc.html?searchId=123"), false);
+  assert.equal(
+    resolveBossJobListUrl({
+      candidate: "https://evil.example/web/geek/jobs",
+      currentUrl: "https://www.zhipin.com/web/user/"
+    }),
+    "https://www.zhipin.com/web/geek/jobs"
+  );
+});
+test("sameJobListUrl ignores volatile security params but catches keyword changes", () => {
+  // 相同筛选，仅 _security_check / ka 变化 → 视为同一列表
+  assert.equal(
+    sameJobListUrl(
+      "https://www.zhipin.com/web/geek/jobs?city=100010000&experience=108,102&query=go&_security_check=1_1788849875794",
+      "https://www.zhipin.com/web/geek/jobs?city=100010000&experience=108,102&query=go&ka=header-job"
+    ),
+    true
+  );
+  // 搜索词变了（go → AI）→ 岗位集合变化 → 不同列表
+  assert.equal(
+    sameJobListUrl(
+      "https://www.zhipin.com/web/geek/jobs?city=100010000&experience=108,102&query=go",
+      "https://www.zhipin.com/web/geek/jobs?city=100010000&experience=108,102&query=AI"
+    ),
+    false
+  );
+  // 城市变了 → 不同列表
+  assert.equal(
+    sameJobListUrl(
+      "https://www.zhipin.com/web/geek/jobs?city=100010000&query=go",
+      "https://www.zhipin.com/web/geek/jobs?city=101010100&query=go"
+    ),
+    false
+  );
+  // 非列表 URL → null（交给后续逐岗核对兜底）
+  assert.equal(
+    sameJobListUrl("https://www.zhipin.com/job_detail/abc.html", "https://www.zhipin.com/web/geek/jobs"),
+    null
+  );
+});
+test("content document change detection distinguishes reload from SPA navigation", () => {
+  assert.equal(didContentDocumentChange({
+    previousInstanceId: "old",
+    currentInstanceId: "new",
+    previousUrl: "https://www.zhipin.com/gongsi/",
+    currentUrl: "https://www.zhipin.com/web/geek/jobs"
+  }), true);
+  assert.equal(didContentDocumentChange({
+    previousInstanceId: "same",
+    currentInstanceId: "same",
+    previousUrl: "https://www.zhipin.com/gongsi/",
+    currentUrl: "https://www.zhipin.com/web/geek/jobs"
+  }), false);
+  assert.equal(didContentDocumentChange({
+    previousInstanceId: "",
+    currentInstanceId: "new",
+    previousUrl: "https://www.zhipin.com/gongsi/",
+    currentUrl: "https://www.zhipin.com/web/geek/jobs"
+  }), true);
+  assert.equal(didContentDocumentChange({
+    previousInstanceId: "old",
+    currentInstanceId: "",
+    previousUrl: "https://www.zhipin.com/gongsi/",
+    currentUrl: "https://www.zhipin.com/web/geek/jobs"
+  }), false);
+});
+
+test("conversation worker prefers job detail and keeps a list fallback", () => {
+  const attempts = buildConversationWorkerAttempts({
+    job: {
+      href: "https://www.zhipin.com/job_detail/job-1.html",
+      listHref: "https://www.zhipin.com/web/geek/jobs?query=AI"
+    }
+  });
+  assert.deepEqual(attempts.map((attempt) => attempt.mode), [
+    CONVERSATION_WORKER_MODE.DETAIL,
+    CONVERSATION_WORKER_MODE.LIST
+  ]);
+  assert.equal(attempts[0].url, "https://www.zhipin.com/job_detail/job-1.html");
+  assert.equal(attempts[1].url, "https://www.zhipin.com/web/geek/jobs?query=AI");
+});
+
+test("left list preservation requires the same tab, URL and document instance", () => {
+  const before = {
+    tabId: 10,
+    url: "https://www.zhipin.com/web/geek/jobs?query=AI",
+    contentInstanceId: "content-a"
+  };
+  assert.equal(isListDocumentPreserved(before, { ...before }), true);
+  assert.equal(isListDocumentPreserved(before, { ...before, url: "https://www.zhipin.com/web/geek/chat" }), false);
+  assert.equal(isListDocumentPreserved(before, { ...before, contentInstanceId: "content-b" }), false);
+});
+
+test("filter matching normalizes spaces, separators, width and case", () => {
+  assert.equal(normalizeMatchText("ＡＩ Agent-优化_工程师"), "aiagent优化工程师");
+  assert.equal(includesKeyword("AI-Agent 优化工程师", "aiagent"), true);
+  assert.equal(includesKeyword("AI & Agent 优化工程师", "ai agent"), true);
+  assert.equal(includesKeyword("阿里 巴巴-集团", "阿里巴巴集团"), true);
+  assert.equal(includesKeyword("熟悉 Multi_Agent、RAG", "multi agent"), true);
+  assert.equal(includesKeyword("C++ 开发", "C++"), true);
+  assert.equal(includesKeyword("C 开发", "C++"), false);
+});
+test("guard message non-empty", () => {
+  assert.ok(bossUrlGuardMessage("https://baidu.com").length > 5);
+  assert.ok(reasonText(REASON.DEDUP_JOB).length > 0);
+});
+
+console.log("7) assets");
+test("logo png valid", () => {
+  const b = fs.readFileSync("docs/assets/logo.png");
+  assert.equal(b[0], 0x89);
+  assert.equal(b[1], 0x50);
+  assert.equal(b[2], 0x4e);
+  assert.equal(b[3], 0x47);
+  assert.ok(b.length > 1000);
+});
+test("logo svg exists", () => {
+  const s = fs.readFileSync("docs/assets/logo.svg", "utf8");
+  assert.ok(s.includes("<svg"));
+  assert.ok(s.includes("#E73A7A"));
+});
+test("screenshots valid png", () => {
+  for (const f of ["01-task", "02-filter", "03-message", "04-resume", "05-settings"]) {
+    const b = fs.readFileSync(`docs/assets/screenshots/${f}.png`);
+    assert.equal(b[0], 0x89);
+    assert.equal(b[1], 0x50);
+  }
+});
+test("manifest version + hosts", () => {
+  const m = JSON.parse(fs.readFileSync("extension/manifest.json", "utf8"));
+  const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+  assert.equal(m.version, pkg.version);
+  assert.ok(m.host_permissions.some((h) => h.includes("zhipin.com")));
+  assert.ok(m.permissions.includes("alarms"));
+  assert.ok(m.content_scripts.every((entry) => entry.matches.every((h) => h.includes("zhipin.com") || h.includes("bosszhipin.com"))));
+  const mainHook = m.content_scripts.find((entry) => entry.world === "MAIN");
+  const isolated = m.content_scripts.find((entry) => !entry.world || entry.world === "ISOLATED");
+  assert.equal(mainHook?.run_at, "document_start");
+  assert.ok(mainHook?.js?.includes("content/page-network-hook.js"));
+  assert.equal(isolated?.js?.[0], "shared/trigger-navigation-recovery.js");
+  assert.equal(isolated?.js?.[1], "shared/conversation-match.js");
+  assert.equal(isolated?.js?.[2], "shared/page-clock.js");
+  assert.equal(isolated?.js?.[3], "shared/operation-dispatch-gate.js");
+  assert.ok(!isolated.js.includes("shared/job-identity.js"), "esm identity module must not be injected as a classic content script");
+  assert.equal(isolated?.js?.[4], "content/content-main.js");
+  assert.ok(m.host_permissions.includes("https://github.com/*"), "update check needs github.com host permission");
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const reminder = fs.readFileSync("extension/sidepanel/update-reminder.js", "utf8");
+  const policy = fs.readFileSync("extension/shared/update-policy.js", "utf8");
+  assert.ok(app.includes("initUpdateReminder") && reminder.includes("btnCheckUpdate"), "update check UI wired");
+  assert.ok(policy.includes("releases.atom"), "update check fetches releases.atom feed");
+});
+test("UI exposes themes, help tips and filter switches", () => {
+  const html = fs.readFileSync("extension/sidepanel/index.html", "utf8");
+  assert.ok(html.includes('data-theme-value="light"'));
+  assert.ok(html.includes('data-theme-value="dark"'));
+  assert.ok((html.match(/data-help=/g) || []).length >= 25);
+  assert.ok(html.includes('id="scheduledDeliveryEnabled"'));
+  assert.equal((html.match(/data-schedule-day=/g) || []).length, 7);
+  for (const id of [
+    "titleOrEnabled",
+    "titleNotEnabled",
+    "companyOrEnabled",
+    "companyNotEnabled",
+    "jdOrEnabled",
+    "jdNotEnabled",
+    "locIncludeEnabled",
+    "locExcludeEnabled"
+  ]) assert.ok(html.includes(`id="${id}"`), `missing ${id}`);
+  assert.ok(!html.includes("AND"));
+  for (const chip of [
+    'data-active="online"',
+    'data-active="just"',
+    'data-active="today"',
+    'data-active="3d"',
+    'data-active="week"',
+    'data-active="2w"',
+    'data-active="month"',
+    'data-active="half"'
+  ]) assert.ok(html.includes(chip), `missing ${chip}`);
+  assert.ok(!html.includes('data-active="2m"'));
+  assert.ok(!html.includes('data-active="3m"'));
+  assert.ok(!html.includes('data-active="4m"'));
+  assert.ok(!html.includes('data-active="3d_ago"'));
+  assert.ok(!html.includes('data-active="year"'));
+  assert.ok(html.includes(">刚刚<"));
+  assert.ok(html.includes(">今日内<"));
+  assert.ok(html.includes(">3日内<"));
+  assert.ok(html.includes(">本周内<"));
+  assert.ok(html.includes(">2周内<"));
+  assert.ok(html.includes(">本月内<"));
+  assert.ok(html.includes(">半年内<"));
+  assert.ok(html.includes(">单选<"));
+  assert.ok(!html.includes("3日前活跃"));
+  assert.ok(!html.includes("一年前活跃"));
+});
+test("resume files are only imported by an explicit save", () => {
+  const sidepanel = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  assert.ok(sidepanel.includes("includePendingFiles: false"));
+  assert.ok(sidepanel.includes("String(target.type || '').toLowerCase() !== 'file'"));
+  assert.ok(sidepanel.includes("resumeSaveChain.then"));
+  assert.ok(sidepanel.includes("const shouldRefresh = opts.refresh !== false"));
+  assert.ok(!sidepanel.includes("const refresh = opts.refresh !== false"));
+  assert.ok(background.includes("dedupeResumeImages(profile?.images)"));
+});
+test("side-by-side layout fills the available display", () => {
+  const layout = computeSideBySideBounds({ left: 0, top: 24, width: 1920, height: 1056 });
+  assert.deepEqual(layout.left, { left: 0, top: 24, width: 960, height: 1056 });
+  assert.deepEqual(layout.right, { left: 960, top: 24, width: 960, height: 1056 });
+  assert.equal(computeSideBySideBounds({ left: 0, top: 0, width: 900, height: 800 }), null);
+  assert.equal(windowBoundsMatch({ left: 0, top: 24, width: 960, height: 1056 }, layout.left), true);
+  assert.equal(windowBoundsMatch({ left: 24, top: 24, width: 940, height: 1056 }, layout.left), true);
+  assert.equal(windowBoundsMatch({ left: 0, top: 24, width: 1280, height: 1056 }, layout.left), false);
+  assert.deepEqual(
+    snapshotWindowBounds({ left: 80, top: 60, width: 1280, height: 900, state: 'maximized' }),
+    { left: 80, top: 60, width: 1280, height: 900, state: 'maximized' }
+  );
+});
+test("list job identity requires a real jobId match and ignores similar titles", () => {
+  assert.equal(isSyntheticJobId(""), true);
+  assert.equal(isSyntheticJobId("name_abc"), true);
+  assert.equal(isSyntheticJobId("e8b92e03b03039140nJ93tu4FlFQ"), false);
+  assert.equal(listJobIdentityMismatch({
+    wantId: "job-a",
+    cardId: "job-a",
+    wantTitle: "前端",
+    gotTitle: "前端"
+  }), "");
+  assert.ok(listJobIdentityMismatch({
+    wantId: "job-a",
+    cardId: "job-b",
+    wantTitle: "前端",
+    gotTitle: "高级前端"
+  }).includes("列表岗位与目标不一致"));
+  assert.ok(listJobIdentityMismatch({
+    wantId: "job-a",
+    hrefId: "job-b",
+    wantTitle: "前端工程师",
+    gotTitle: "前端工程师"
+  }).includes("列表岗位与目标不一致"));
+  assert.equal(listJobIdentityMismatch({
+    wantId: "name_hash",
+    cardId: "job-b",
+    wantTitle: "前端",
+    gotTitle: "后端"
+  }), "");
+});
+test("delivery interval wait is shown on the running status line", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const css = fs.readFileSync("extension/sidepanel/styles.css", "utf8");
+  assert.ok(background.includes("async function waitDeliveryInterval"));
+  assert.ok(background.includes("intervalWaitUntil"));
+  assert.ok(background.includes("await waitDeliveryInterval(task, waitMs)"));
+  assert.ok(app.includes("投递间隔等待中 · 还剩"));
+  assert.ok(app.includes("intervalWaitRemainingSeconds"));
+  assert.ok(css.includes('data-status="waiting"'));
+});
+test("task start prepares split workspace with fallback", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  assert.ok(background.includes("prepareSplitWorkspace"));
+  assert.ok(background.includes("computeSideBySideBounds"));
+  assert.ok(background.includes("splitViewActive"));
+  assert.ok(background.includes("普通消息标签页"));
+  assert.ok(background.includes("职位页优先留在用户原来的窗口"));
+  assert.ok(background.includes("applySplitWindowBounds"));
+  assert.ok(background.includes("restoreWindowSnapshot"));
+  assert.ok(background.includes("raiseSplitWindows(listWindowId, messageWindowId)"));
+  // 原窗口拒绝摆放时允许把列表页搬进新建窗口（仅回退路径），失败必须搬回原窗口
+  assert.ok(background.includes("tabId: listTab.id"), "fallback may detach the job list into a new window");
+  assert.ok(background.includes("chrome.tabs.move(listTab.id, { windowId: sourceWindowId"));
+  assert.ok(background.includes("relocated"), "relocation must be tracked");
+});
+test("floating controls stay fully visible after a split-window resize", () => {
+  const source = fs.readFileSync("extension/content/floating-host.js", "utf8");
+  let domLookups = 0;
+  const context = {
+    window: { location: { href: "https://www.zhipin.com/web/geek/chat" } },
+    document: {
+      readyState: "complete",
+      addEventListener() {},
+      getElementById() {
+        domLookups++;
+        return null;
+      }
+    },
+    chrome: { runtime: { onMessage: { addListener() {} } } },
+    console,
+    setInterval() {},
+    setTimeout() {},
+    cancelAnimationFrame() {},
+    requestAnimationFrame() { return 1; }
+  };
+  vm.runInNewContext(source, context);
+  const fit = context.window.__BHT_FLOAT_LAYOUT__.fitRectToViewport;
+  const isMessagePage = context.window.__BHT_FLOAT_LAYOUT__.isMessagePage;
+  const panel = fit(
+    { left: 1400, top: 100, width: 420, height: 700 },
+    { width: 960, height: 900 },
+    8
+  );
+  const fab = fit(
+    { left: 1800, top: 1000, width: 58, height: 58 },
+    { width: 960, height: 900 },
+    0
+  );
+  assert.equal(panel.left, 532);
+  assert.equal(panel.top, 100);
+  assert.equal(fab.left, 902);
+  assert.equal(fab.top, 842);
+  assert.equal(isMessagePage("https://www.zhipin.com/web/geek/chat"), true);
+  assert.equal(isMessagePage("https://www.zhipin.com/web/geek/jobs"), false);
+  assert.equal(domLookups, 0, "message pages must not mount the floating host");
+  assert.ok(source.includes('window.addEventListener("resize", schedule)'));
+  assert.ok(source.includes('root.style.display = "none"'));
+  assert.ok(!source.includes("window.innerWidth - 80"));
+});
+
+console.log("8) conversation selection + delivery receipt");
+test("friend-content is not mistaken for active", () => {
+  assert.equal(hasActiveState("friend-content", ""), false);
+  assert.equal(hasActiveState("friend-content active", ""), true);
+  assert.equal(hasActiveState("friend-content", "true"), true);
+});
+test("stable conversation key ignores changing preview text", () => {
+  const a = stableConversationKey({
+    identityText: "王女士|示例科技|Java 开发",
+    text: "王女士\n示例科技\nJava 开发\n10:21\n您好"
+  });
+  const b = stableConversationKey({
+    identityText: "王女士|示例科技|Java 开发",
+    text: "王女士\n示例科技\nJava 开发\n10:28\n收到简历"
+  });
+  assert.equal(a, b);
+});
+test("HR activity suffix is removed before conversation matching", () => {
+  assert.equal(cleanHrIdentity("范女士 在线"), "范女士");
+  assert.equal(cleanHrIdentity("赵舒雅 本周活跃"), "赵舒雅");
+  assert.equal(cleanHrIdentity("李响 · 刚刚活跃"), "李响");
+});
+test("select exact company and title conversation", () => {
+  const picked = selectConversationCandidate([
+    { index: 0, key: "a", text: "李女士 其他科技 Java 开发" },
+    { index: 1, key: "b", text: "王女士 示例科技 Java 开发" }
+  ], {
+    company: "示例科技",
+    title: "Java 开发",
+    hrName: "王女士"
+  }, ["a", "b"]);
+  assert.equal(picked.ok, true);
+  assert.equal(picked.item.key, "b");
+});
+test("select the only newly-created conversation", () => {
+  const picked = selectConversationCandidate([
+    { index: 0, key: "new", text: "赵先生 新会话" },
+    { index: 1, key: "old", text: "历史会话" }
+  ], { company: "", title: "" }, ["old"]);
+  assert.equal(picked.ok, true);
+  assert.equal(picked.item.key, "new");
+  assert.equal(picked.via, "new-single");
+});
+test("ambiguous conversations stop instead of guessing", () => {
+  const picked = selectConversationCandidate([
+    { index: 0, key: "a", text: "示例科技 Java 工程师" },
+    { index: 1, key: "b", text: "示例科技 Java 工程师" }
+  ], { company: "示例科技", title: "Java 工程师" }, ["a", "b"]);
+  assert.equal(picked.ok, false);
+  assert.equal(picked.error, "CONVERSATION_AMBIGUOUS");
+});
+test("input clearing alone cannot confirm a send", () => {
+  assert.equal(
+    confirmRenderedOwnMessage(["历史消息"], ["历史消息"], "新的测试消息"),
+    false
+  );
+});
+test("new rendered own message confirms a send", () => {
+  assert.equal(
+    confirmRenderedOwnMessage(["历史消息"], ["历史消息", "新的测试消息"], "新的测试消息"),
+    true
+  );
+});
+
+test("BOSS text-content own message confirms a send", () => {
+  assert.equal(
+    confirmRenderedOwnMessage(
+      ["历史消息"],
+      ["历史消息", "我对机房运维工程师很感兴趣，希望能进一步沟通。"],
+      "我对机房运维工程师很感兴趣，希望能进一步沟通。"
+    ),
+    true
+  );
+});
+test("content keeps text and image receipts while platform resume automation is absent", () => {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const sidepanel = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const messaging = fs.readFileSync("extension/shared/messaging.js", "utf8");
+  assert.ok(content.includes(".friend-content"));
+  assert.ok(content.includes('".name-box"'));
+  assert.ok(content.includes('confirmedVia: "self-message-dom"'));
+  assert.ok(content.includes("sendImageFromDataUrl"));
+  assert.ok(content.includes('type: "IMAGE_SENT"'));
+  assert.ok(!content.includes("sendPlatformResume"));
+  assert.ok(!content.includes('type: "RESUME_SENT"'));
+  assert.ok(!content.includes("输入框被清空也视为已发送"));
+  assert.ok(background.includes("receiptConfirmed"));
+  assert.ok(background.includes("TASK_COMPLETED"));
+  assert.ok(background.includes("TASK_STOPPED"));
+  assert.ok(background.includes("成功投递"));
+  assert.ok(!background.includes("MSG.SEND_RESUME"));
+  assert.ok(!background.includes("profile.attachment.dataUrl"));
+  assert.ok(sidepanel.includes("MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024"));
+  assert.ok(!messaging.includes("BHT_SEND_RESUME"));
+});
+
+
+console.log("8b) delivery control & image receipt contracts");
+test("image send requires confirmed IMAGE_SENT receipt", () => {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  assert.ok(content.includes("waitForImageSendConfirm"));
+  assert.ok(content.includes("IMAGE_SEND_NOT_CONFIRMED"));
+  assert.ok(content.includes('type: "IMAGE_SENT"'));
+  assert.ok(background.includes("imgRes?.receipt?.type === 'IMAGE_SENT'"));
+  assert.ok(background.includes("return 'failed'"));
+  assert.ok(background.includes("图片简历发送失败"));
+});
+
+test("skip while paused does not leave skipCurrent sticky", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  assert.ok(background.includes("runner.skipCurrent = false"));
+  assert.ok(background.includes("已跳过当前岗位，继续下一岗"));
+  // paused skip path clears flag before resuming loop
+  assert.ok(background.includes("若在等待用户重试的暂停中：直接标记当前岗位跳过"));
+});
+
+test("resume stage rechecks pause/abort/skip controls", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  assert.ok(background.includes("resume: re-check controls after last text segment"));
+  assert.ok(background.includes("await waitWhilePaused();"));
+});
+
+test("template version only bumps when message content changes", () => {
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  assert.ok(app.includes("templateSegmentsSignature"));
+  assert.ok(app.includes("shouldBump = opts.bumpVersion !== false && changed"));
+  assert.ok(app.includes("readTemplate(prevTemplate, { bumpVersion: false })"));
+  assert.ok(app.includes("ensureConfigSavedBeforeDelivery"));
+});
+
+test("deleting a message segment preserves unsaved DOM edits", () => {
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const start = app.indexOf("box.querySelectorAll('[data-del]')");
+  const end = app.indexOf("box.querySelectorAll('[data-kind], [data-en], [data-text]')", start);
+  assert.ok(start > 0 && end > start);
+  const block = app.slice(start, end);
+  assert.ok(block.includes("const draft = readTemplate(state.config.messageTemplate"));
+  assert.ok(block.includes("draft.segments.filter((s) => s.id !== id)"));
+});
+
+test("start/test delivery refuses ALREADY_RUNNING and requires pre-save", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  assert.ok(background.includes("error: 'ALREADY_RUNNING'"));
+  assert.ok(background.includes("withRunnerAdmission('starting'"));
+  assert.ok(background.includes("runner.previewing"));
+  assert.ok(app.includes("await ensureConfigSavedBeforeDelivery()"));
+  assert.ok(app.includes("persistDirtyConfigSections"));
+  assert.ok(app.includes("配置已在其他面板更新"),
+    "cross-panel config conflicts must block delivery instead of overwriting remote state");
+  assert.ok(app.includes("$('btnStart').disabled = false"),
+    "batch delivery must be retryable after a pre-save conflict");
+  assert.ok(app.includes("$('btnTestOne').disabled = false"),
+    "single delivery must be retryable after a pre-save conflict");
+  assert.ok(app.includes("const localChanged = new Set()"),
+    "delivery pre-save must be section-scoped");
+  assert.ok(!app.includes("try { await saveSettings(); await saveResume(); await saveMessage(); } catch (_) {}"));
+});
+
+test("service worker reconciles stale running tasks after restart", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  assert.ok(background.includes("async function reconcileStaleRunningTask"));
+  assert.ok(background.includes("chrome.runtime.onStartup"));
+  assert.ok(background.includes("任务已安全暂停"));
+});
+
+test("preview scan uses try/finally to restore button", () => {
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const start = app.indexOf("$('btnPreview').addEventListener('click'");
+  assert.ok(start > 0);
+  const end = app.indexOf("$('btnDiagnose')", start);
+  const chunk = app.slice(start, end > start ? end : start + 4000);
+  assert.ok(chunk.includes("try {"));
+  assert.ok(chunk.includes("} finally {"));
+  assert.ok(chunk.includes("$('btnPreview').disabled = false"));
+});
+
+test("debug logging is session-only, toggleable and exportable", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const html = fs.readFileSync("extension/sidepanel/index.html", "utf8");
+  const debugLog = fs.readFileSync("extension/shared/debug-log.js", "utf8");
+  assert.ok(debugLog.includes("chrome.storage.session"));
+  assert.ok(background.includes("case MSG.GET_DEBUG_LOGS"));
+  assert.ok(content.includes("conversation_selection"));
+  assert.ok(content.includes("conversation_switch_probe"));
+  assert.ok(content.includes("dom_event"));
+  assert.ok(content.includes("dom_mutation_batch"));
+  assert.ok(content.includes("window_error"));
+  assert.ok(content.includes("operation_dispatch_exception"));
+  assert.ok(content.includes("click_dispatched"));
+  assert.ok(app.includes("btnExportDebugLogs"));
+  assert.ok(app.includes("ui_click"));
+  assert.ok(app.includes("api_exception"));
+  assert.ok(html.includes('id="debugLoggingEnabled"'));
+});
+
+test("trigger conversation always returns its result and reports undefined operations", () => {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const triggerStart = content.indexOf("async function triggerConversationOnList");
+  const triggerEnd = content.indexOf("const ConversationMatch", triggerStart);
+  const trigger = content.slice(triggerStart, triggerEnd);
+  assert.ok(trigger.includes('debugTrace("trigger_conversation_done", triggerResult)'));
+  assert.ok(trigger.includes("return triggerResult"));
+  assert.ok(trigger.includes("TRIGGER_CONVERSATION_EXCEPTION"));
+  assert.equal((content.match(/return triggerResult/g) || []).length, 1);
+  assert.ok(content.includes("OP_RETURN_UNDEFINED"));
+});
+
+test("legacy message and local attachment paths stay removed", () => {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const messaging = fs.readFileSync("extension/shared/messaging.js", "utf8");
+  const html = fs.readFileSync("extension/sidepanel/index.html", "utf8");
+  const storage = fs.readFileSync("extension/shared/storage.js", "utf8");
+  const combined = [content, background, app, messaging, html].join("\n");
+  for (const legacyType of [
+    "BHT_OPEN_JOB",
+    "BHT_SEND_FILE_META",
+    "BHT_GET_CURRENT_JOB_DETAIL",
+    "BHT_GET_PAGE_INFO",
+    "BHT_GET_LOGS"
+  ]) {
+    assert.ok(!combined.includes(legacyType), legacyType + " should stay removed");
+  }
+  assert.ok(!content.includes("function openJobDetail"));
+  assert.ok(!content.includes("function getCurrentJobDetail"));
+  assert.ok(!app.includes("attachFile"));
+  assert.ok(!app.includes("btnClearAttach"));
+  assert.ok(!html.includes('option value="on_request"'));
+  assert.ok(storage.includes("normalized.resumeSendTiming === 'on_request'"));
+  assert.ok(storage.includes("normalized.resumeSendTiming = 'after_text'"));
+  assert.ok(storage.includes("delete normalized.autoSendAttachmentResume"));
+  assert.ok(!app.includes("autoSendAttachmentResume"));
+  assert.ok(!html.includes("autoSendAttachmentResume"));
+  assert.ok(!background.includes("bht_migrated_137"));
+  const missingButtonStart = content.indexOf('error: "CHAT_BUTTON_NOT_FOUND"', content.indexOf("async function triggerConversationOnList"));
+  const missingButtonBranch = content.slice(missingButtonStart, missingButtonStart + 500);
+  assert.ok(missingButtonBranch.includes("return missingButton"));
+});
+
+test("current BOSS card treats boss-name as company and detail name as HR", () => {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  assert.ok(content.includes('".job-card-footer .boss-name"'));
+  assert.ok(content.includes('"a[ka^=\'company_logo_click\']"'));
+  assert.ok(content.includes('".job-boss-info .name"'));
+  const parseStart = content.indexOf("function parseJobCard");
+  const parseEnd = content.indexOf("async function autoScrollList", parseStart);
+  const parse = content.slice(parseStart, parseEnd);
+  assert.ok(!parse.includes("if (SELECTORS.hrName)"));
+  assert.ok(parse.includes("当前 BOSS 列表卡中的 .boss-info/.boss-name 是公司"));
+});
+
+test("job failure counters persist before storage is reloaded", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const processAt = background.indexOf("let outcome = await processOneJob(task, row, config)");
+  const reloadAt = background.indexOf("config = await getAllConfig()", processAt);
+  const between = background.slice(processAt, reloadAt);
+  assert.ok(between.includes("await publishTask(task)"));
+  assert.ok(between.includes("job_process_returned"));
+});
+
+test("conversation opener never repeatedly clicks the same candidate", () => {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const start = content.indexOf("async function waitAndOpenConversation");
+  const end = content.indexOf("async function waitChatEditor", start);
+  const chunk = content.slice(start, end);
+  assert.ok(chunk.includes("const attemptedKeys = new Set()"));
+  assert.ok(chunk.includes("conversation_candidate_already_clicked"));
+  assert.ok(!/i === 3[\s\S]{0,250}clickLikeHuman/.test(chunk));
+});
+
+console.log("9) split workspace integration");
+try {
+  const listTab = {
+    id: 10,
+    windowId: 1,
+    url: "https://www.zhipin.com/web/geek/jobs",
+    status: "complete"
+  };
+  const messageTab = {
+    id: 20,
+    windowId: 2,
+    url: "https://www.zhipin.com/web/geek/chat",
+    status: "complete"
+  };
+  const windowCalls = [];
+  const windowState = {
+    1: { id: 1, left: 80, top: 60, width: 1280, height: 900, tabs: [] },
+    2: { id: 2, left: 80, top: 60, width: 1280, height: 900, tabs: [] }
+  };
+  let displayWidth = 1920;
+  globalThis.chrome = {
+    storage: { local: {
+      async get(key) {
+        return key === STORAGE_KEYS.UPDATE ? { [key]: { lastCheckedAt: Date.now(), lastAttemptAt: Date.now() } } : {};
+      },
+      async set() {}
+    } },
+    runtime: {
+      onInstalled: { addListener() {} },
+      onMessage: { addListener() {} },
+      sendMessage() { return Promise.resolve({ ok: true }); }
+    },
+    action: { onClicked: { addListener() {} } },
+    tabs: {
+      onUpdated: { addListener() {} },
+      onActivated: { addListener() {} },
+      async query(query) {
+        if (query?.active) return [listTab];
+        if (query?.url) return [listTab];
+        if (query?.windowId === 2) return [messageTab];
+        return [];
+      },
+      async get(tabId) {
+        if (tabId === listTab.id) return listTab;
+        if (tabId === messageTab.id) return messageTab;
+        throw new Error("unknown tab " + tabId);
+      },
+      async update(tabId, patch) {
+        windowCalls.push({ api: "tabs.update", tabId, patch });
+        return tabId === messageTab.id ? { ...messageTab, ...patch } : { ...listTab, ...patch };
+      },
+      async setZoomSettings(tabId, settings) {
+        windowCalls.push({ api: "tabs.setZoomSettings", tabId, settings });
+      },
+      async setZoom(tabId, zoomFactor) {
+        windowCalls.push({ api: "tabs.setZoom", tabId, zoomFactor });
+      }
+    },
+    scripting: {
+      async executeScript(options) {
+        if (options?.func) {
+          return [{ result: { left: 0, top: 24, width: displayWidth, height: 1056 } }];
+        }
+        windowCalls.push({ api: "scripting.executeScript", tabId: options?.target?.tabId });
+        return [];
+      }
+    },
+    windows: {
+      async get(windowId) {
+        return { ...(windowState[windowId] || { id: windowId, left: 80, top: 60, width: 1280, height: 900, tabs: [] }) };
+      },
+      async update(windowId, patch) {
+        windowCalls.push({ api: "windows.update", windowId, patch });
+        windowState[windowId] = { ...(windowState[windowId] || { id: windowId }), id: windowId, ...patch };
+        return windowState[windowId];
+      },
+      async create(options) {
+        windowCalls.push({ api: "windows.create", options });
+        windowState[2] = {
+          id: 2,
+          left: options.left ?? 960,
+          top: options.top ?? 24,
+          width: options.width ?? 960,
+          height: options.height ?? 1056,
+          tabs: [messageTab]
+        };
+        return { id: 2, tabs: [messageTab], ...windowState[2] };
+      }
+    }
+  };
+
+  const { prepareSplitWorkspace } = await import("../extension/background/service-worker.js");
+  const task = { execution: { listTabId: listTab.id, listWindowId: listTab.windowId } };
+  const split = await prepareSplitWorkspace(task, { splitViewEnabled: true });
+  assert.equal(split.ok, true);
+  assert.equal(task.execution.splitViewActive, true);
+  assert.equal(task.execution.messageTabId, messageTab.id);
+  assert.deepEqual(split.bounds.left, { left: 0, top: 24, width: 960, height: 1056 });
+  assert.deepEqual(split.bounds.right, { left: 960, top: 24, width: 960, height: 1056 });
+  assert.equal(split.zoomFactor, 0.8);
+  assert.equal(split.zoomApplied, true);
+  assert.equal(task.execution.splitZoomFactor, 0.8);
+  assert.deepEqual(
+    windowCalls.filter((call) => call.api === "tabs.setZoom").map((call) => [call.tabId, call.zoomFactor]),
+    [[listTab.id, 0.8], [messageTab.id, 0.8]]
+  );
+  assert.ok(windowCalls
+    .filter((call) => call.api === "tabs.setZoomSettings")
+    .every((call) => call.settings.mode === "automatic" && call.settings.scope === "per-tab"));
+  assert.ok(windowCalls.some((call) => call.api === "windows.create" && call.options.left === 960), "chat window is created or placed on the right");
+  assert.ok(!windowCalls.some((call) => call.api === "windows.create" && call.options.tabId === listTab.id), "job list stays in the original window");
+  assert.ok(windowCalls.some((call) => call.api === "windows.update" && call.windowId === listTab.windowId && call.patch.left === 0), "original window is resized to the left half");
+  assert.ok(windowCalls.some((call) => call.api === "windows.update" && call.windowId === 2 && call.patch.focused === true));
+
+  const createsBeforeFallback = windowCalls.filter((call) => call.api === "windows.create").length;
+  displayWidth = 900;
+  const fallbackTask = { execution: { listTabId: listTab.id, listWindowId: listTab.windowId } };
+  const fallback = await prepareSplitWorkspace(fallbackTask, { splitViewEnabled: true });
+  assert.equal(fallback.ok, false);
+  assert.equal(fallback.error, "DISPLAY_TOO_SMALL");
+  assert.equal(fallbackTask.execution.splitViewActive, false);
+  assert.equal(windowCalls.filter((call) => call.api === "windows.create").length, createsBeforeFallback);
+  passed++;
+  console.log("  PASS browser windows split and narrow-display fallback");
+} catch (e) {
+  console.error("  FAIL browser windows split and narrow-display fallback -", e.message);
+  process.exitCode = 1;
+}
+
+
+console.log("11a) preview reason wording");
+test("preview reason count wording", () => {
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  assert.ok(app.includes("formatPreviewReasonLine"), "has formatPreviewReasonLine");
+  assert.ok(app.includes("被排除岗位数"), "explains count is job count");
+  assert.ok(app.includes("生效设置"), "shows effective settings snapshot");
+  assert.ok(app.includes("companyDailyMax"), "mentions companyDailyMax in preview");
+});
+
+console.log("11b) batch button after single delivery");
+test("batch delivery not limited to awaiting_confirm", () => {
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  assert.ok(app.includes("canBatch"), "updateTaskUI should compute canBatch");
+  assert.ok(app.includes("还剩") || app.includes("未投"), "status should mention remaining jobs");
+  assert.ok(app.includes("is-armed"), "control buttons use armed highlight");
+  assert.ok(!/btnStart'\)\.disabled = !\(onBoss && status === 'awaiting_confirm'\)/.test(app), "old awaiting_confirm-only gate must be gone");
+  const sw = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  assert.ok(sw.includes("NO_PENDING") || sw.includes("没有可批量投递"), "CONFIRM_AND_START handles empty pending");
+  assert.ok(sw.includes("批量投递启动"), "batch start log present");
+  assert.ok(sw.includes("自动勾选剩余未投通过岗") || sw.includes("testDelivery"), "restore selection after single delivery");
+});
+
+test("target mode starts a new run after a terminal task", () => {
+  const sw = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  assert.ok(sw.includes("function createFreshTargetTask"), "terminal target runs get a fresh task snapshot");
+  assert.ok(sw.includes("const freshTargetRun = targetMode"), "fresh-task path is limited to terminal target runs");
+  assert.ok(sw.includes("task = createFreshTargetTask(task)"), "new target run replaces the old task");
+  assert.ok(sw.includes("counters: { processed: 0, success: 0, skipped: 0, failed: 0 }"), "new target run resets counters");
+  assert.ok(!sw.includes("baselineSuccess + targetCount"), "new target count is independent of the previous run");
+});
+
+console.log("12) test-delivery next job");
+const sampleResults = [
+  { decision: "pass", selected: true, job: { jobId: "a", title: "岗A", company: "公司A" } },
+  { decision: "pass", selected: true, job: { jobId: "b", title: "岗B", company: "公司B" } },
+  { decision: "pass", selected: false, job: { jobId: "c", title: "岗C", company: "公司C" } },
+  { decision: "reject", job: { jobId: "d", title: "岗D", company: "公司D" } }
+];
+
+test("first click picks first pass", () => {
+  const r = pickNextTestDeliveryJob({ results: sampleResults });
+  assert.equal(r.ok, true);
+  assert.equal(r.onlyId, "a");
+  assert.equal(r.remain, 2);
+});
+
+test("second click after a completed picks b", () => {
+  const r = pickNextTestDeliveryJob({
+    results: sampleResults,
+    items: [{ jobId: "a", state: "COMPLETED" }]
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.onlyId, "b");
+  assert.equal(r.remain, 1);
+});
+
+test("wantId ignores already done and falls through", () => {
+  const r = pickNextTestDeliveryJob({
+    results: sampleResults,
+    items: [{ jobId: "a", state: "COMPLETED" }],
+    wantId: "a"
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.onlyId, "b");
+});
+
+test("extraDoneIds / testedJobIds advances even if queue wiped", () => {
+  const r = pickNextTestDeliveryJob({
+    results: sampleResults,
+    queue: [{ jobId: "b", status: "pending" }],
+    extraDoneIds: ["a"]
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.onlyId, "b");
+});
+
+test("all tested returns ALL_TESTED", () => {
+  const r = pickNextTestDeliveryJob({
+    results: sampleResults,
+    items: [
+      { jobId: "a", state: "COMPLETED" },
+      { jobId: "b", state: "SKIPPED" },
+      { jobId: "c", state: "COMPLETED" }
+    ]
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.error, "ALL_TESTED");
+});
+
+test("collectDoneJobIds merges items queue and extra", () => {
+  const s = collectDoneJobIds(
+    [{ jobId: "x", state: "COMPLETED" }],
+    [{ jobId: "y", status: "skipped" }],
+    ["z"]
+  );
+  assert.ok(s.has("x") && s.has("y") && s.has("z"));
+});
+
+test("投递一份 skip chain advances in order, no repeats, and stops after success", () => {
+  // 复刻后台队列循环在 testDelivery 模式下的顺延机制：
+  // 跳过 → 记入 items/queue/testedJobIds → pickNextTestDeliveryJob 取下一个 → 重复
+  const results = [
+    { decision: "pass", selected: true, job: { jobId: "a", title: "岗a" } },
+    { decision: "pass", selected: true, job: { jobId: "b", title: "岗b" } },
+    { decision: "pass", selected: true, job: { jobId: "c", title: "岗c" } },
+    { decision: "pass", selected: true, job: { jobId: "d", title: "岗d" } }
+  ];
+  const state = { items: [], queue: [], testedJobIds: [] };
+  const pickNext = () =>
+    pickNextTestDeliveryJob({
+      results,
+      items: state.items,
+      queue: state.queue,
+      extraDoneIds: state.testedJobIds
+    });
+  const markSkipped = (id) => {
+    state.items.push({ jobId: id, state: "SKIPPED" });
+    state.queue.push({ jobId: id, status: "skipped" });
+    state.testedJobIds.push(id);
+  };
+
+  // a、b 活跃不满足跳过；c 也不算，跳过；d 满足 → 成功停止
+  const chain = [];
+  for (;;) {
+    const r = pickNext();
+    if (!r.ok) break;
+    chain.push(r.onlyId);
+    if (r.onlyId === "d") break;
+    markSkipped(r.onlyId);
+  }
+  assert.deepEqual(chain, ["a", "b", "c", "d"]);
+  assert.equal(new Set(chain).size, 4, "no duplicate picks in chain");
+
+  // 结束后再取：全部已处理 → ALL_TESTED（不会重复点回 a/b/c）
+  const allDone = pickNextTestDeliveryJob({
+    results,
+    items: [...state.items, { jobId: "d", state: "COMPLETED" }],
+    queue: [...state.queue, { jobId: "d", status: "done" }],
+    extraDoneIds: [...state.testedJobIds, "d"]
+  });
+  assert.equal(allDone.ok, false);
+  assert.equal(allDone.error, "ALL_TESTED");
+
+  // 队列被清空（重新点投递一份会重建 queue）但 testedJobIds 仍在：不会重投已跳过岗位
+  const afterWipe = pickNextTestDeliveryJob({
+    results,
+    items: state.items.map((x) => ({ jobId: x.jobId, state: "SKIPPED" })),
+    queue: [],
+    extraDoneIds: [...state.testedJobIds, "d"]
+  });
+  assert.equal(afterWipe.ok, false);
+  assert.equal(afterWipe.error, "ALL_TESTED");
+
+  // 部分跳过 + 剩余未投：顺延落在第一个未处理岗
+  const partial = pickNextTestDeliveryJob({
+    results: results.slice(0, 3),
+    items: [{ jobId: "a", state: "SKIPPED" }],
+    queue: [{ jobId: "a", status: "skipped" }],
+    extraDoneIds: ["a"]
+  });
+  assert.equal(partial.ok, true);
+  assert.equal(partial.onlyId, "b");
+});
+
+console.log("13) task model + cancellation contract");
+test("shared task model owns queue dedupe and pending counts", () => {
+  const task = {
+    results: [
+      { decision: "pass", selected: true, job: { jobId: "a", title: "Java", company: "A" } },
+      { decision: "pass", selected: true, job: { jobId: "a", title: "Java", company: "A" } },
+      { decision: "pass", selected: true, job: { jobId: "b", title: "Go", company: "B" } },
+      { decision: "reject", job: { jobId: "c", title: "Sales", company: "C" } }
+    ],
+    items: [{ jobId: "a", state: "COMPLETED" }],
+    queue: [],
+    testedJobIds: [],
+    counters: { success: 1, skipped: 2, failed: 3, processed: 6 }
+  };
+  assert.equal(buildDeliveryQueue(task.results).length, 2);
+  assert.equal(countPassJobs(task), 3);
+  assert.equal(countPendingPassJobs(task), 1);
+  assert.deepEqual(taskCounterSnapshot(task), { success: 1, skipped: 2, failed: 3, processed: 6 });
+});
+
+test("job expectation context uses stable ids instead of display labels", () => {
+  const items = [
+    { id: "548669349", encryptId: "expect-a", positionName: "运维/技术支持", locationName: "广州" },
+    { id: "548669350", encryptId: "expect-b", positionName: "运维/技术支持", locationName: "深圳" }
+  ];
+  assert.equal(expectationDisplayLabel(items[0]), "运维/技术支持(广州)");
+  assert.equal(findExpectationMatches(items, { key: "expect-a" }).length, 1);
+  assert.equal(findExpectationMatches(items, { label: "运维/技术支持(广州)" })[0].encryptId, "expect-a");
+  assert.equal(sameJobSourceContext(
+    { sourceType: JOB_SOURCE_TYPES.EXPECTATION, expectationKey: "expect-a" },
+    { sourceType: JOB_SOURCE_TYPES.EXPECTATION, expectationKey: "expect-b" }
+  ), false);
+  assert.equal(sameJobSourceContext(
+    { sourceType: JOB_SOURCE_TYPES.RECOMMEND },
+    { sourceType: JOB_SOURCE_TYPES.RECOMMEND }
+  ), true);
+  assert.equal(JOB_SOURCE_TYPES.SEARCH, "search");
+  assert.equal(sameJobSourceContext(
+    { sourceType: JOB_SOURCE_TYPES.SEARCH, searchKey: "/web/geek/jobs?query=ai" },
+    { sourceType: JOB_SOURCE_TYPES.SEARCH, searchKey: "/web/geek/jobs?query=ai" }
+  ), true);
+  assert.equal(sameJobSourceContext(
+    { sourceType: JOB_SOURCE_TYPES.SEARCH, searchKey: "/web/geek/jobs?query=ai" },
+    { sourceType: JOB_SOURCE_TYPES.SEARCH, searchKey: "/web/geek/jobs?query=java" }
+  ), false);
+});
+
+test("pause modal stays above task controls", () => {
+  const styles = fs.readFileSync("extension/sidepanel/styles.css", "utf8");
+  const modal = styles.match(/\.bht-modal\s*\{[^}]*\}/)?.[0] || "";
+  assert.match(modal, /z-index:\s*130000/);
+  assert.ok(!styles.includes("#btnStop { position: relative; z-index: 10001; }"));
+});
+
+test("filter context comparison is conservative when request evidence exists", () => {
+  const base = { request: { experience: "101", degree: "201", scale: "", jobType: "", salary: "", industry: "" }, hints: ["工作经验"] };
+  assert.equal(sameFilterSignature(base, structuredClone(base)), true);
+  assert.equal(sameFilterSignature(base, { ...base, request: { ...base.request, degree: "202" } }), false);
+  assert.equal(sameFilterSignature({ hints: ["学历", "公司规模"] }, { hints: ["公司规模", "学历"] }), true);
+  assert.equal(sameFilterSignature(
+    { hints: ["1-3年", "大专"] },
+    { request: { experience: "104", degree: "202" }, hints: ["1-3年", "大专"] }
+  ), true);
+  assert.equal(sameFilterSignature(
+    { hints: ["1-3年"] },
+    { request: { experience: "105" }, hints: ["3-5年"] }
+  ), false);
+  assert.equal(sameFilterSignature(
+    { observed: true, request: {}, hints: ["刚刚活跃", "运维/技术支持(广州)"] },
+    { observed: true, request: {}, hints: [] }
+  ), true);
+});
+
+test("refresh merge keeps previous jobs and removes new-batch duplicates", () => {
+  const previous = [
+    { decision: "pass", selected: true, job: { jobId: "a", title: "Java", company: "A" } },
+    { decision: "reject", selected: false, job: { jobId: "b", title: "Go", company: "B" } }
+  ];
+  const incoming = [
+    { decision: "pass", selected: true, job: { jobId: "a", title: "Java", company: "A" } },
+    { decision: "pass", selected: true, job: { jobId: "c", title: "Python", company: "C" } }
+  ];
+  const merged = mergeTaskResults(previous, incoming);
+  assert.deepEqual(merged.results.map((row) => row.job.jobId), ["a", "b", "c"]);
+  assert.equal(merged.added, 1);
+  const queue = rebuildDeliveryQueue(merged.results, [{ jobId: "a", status: "done" }], ["a"]);
+  assert.deepEqual(queue.map((item) => [item.jobId, item.status]), [["a", "done"], ["c", "pending"]]);
+  const currentRefreshBatch = queue
+    .filter((item) => item.status === "pending")
+    .map((item, index) => ({ ...item, index }));
+  assert.deepEqual(currentRefreshBatch.map((item) => [item.jobId, item.status, item.index]), [["c", "pending", 0]],
+    "a refresh batch starts at queue position 1 while historical done jobs remain available for dedupe");
+  const refreshed = rebuildDeliveryQueue(
+    [
+      { decision: "pass", selected: true, job: { jobId: "failed", title: "失败岗", company: "A" } },
+      { decision: "pass", selected: true, job: { jobId: "new", title: "新岗位", company: "B" } }
+    ],
+    [{ jobId: "failed", status: "failed", outcome: "failed" }],
+    ["failed"]
+  );
+  assert.deepEqual(refreshed.map((item) => [item.jobId, item.status]), [["failed", "failed"], ["new", "pending"]],
+    "refresh must keep failed jobs out of the pending queue; explicit retry resets them separately");
+  assert.equal(jobMergeKey({ jobId: "a" }), "id:a");
+  assert.notEqual(
+    jobMergeKey({ jobId: "name_old", company: "同一公司", title: "同一职位", location: "广州", securityId: "sid-1", lid: "lid-1" }),
+    jobMergeKey({ jobId: "name_new", company: "同一公司", title: "同一职位", location: "广州", securityId: "sid-2", lid: "lid-2" })
+  );
+  const incomplete = { jobId: "name_old", company: "同一公司", title: "同一职位", location: "广州" };
+  const enriched = { jobId: "dom_new", company: "同一公司", title: "同一职位", location: "广州", securityId: "sid-1", lid: "lid-1" };
+  assert.equal(jobsShareMergeIdentity(incomplete, enriched), true);
+  assert.equal(jobsShareMergeIdentity(
+    { ...incomplete, securityId: "sid-1" },
+    { ...enriched, jobId: "real-1" }
+  ), true);
+  assert.equal(jobsShareMergeIdentity(
+    { ...incomplete, lid: "lid-1" },
+    { ...enriched, jobId: "real-1", securityId: "" }
+  ), true);
+  assert.equal(jobsShareMergeIdentity(
+    { ...incomplete, href: "https://www.zhipin.com/job_detail/1.html" },
+    { ...enriched, jobId: "real-1", href: "https://www.zhipin.com/job_detail/1.html" }
+  ), true);
+  assert.equal(jobsShareMergeIdentity(
+    incomplete,
+    { ...enriched, location: "深圳", securityId: "", lid: "" }
+  ), false);
+  assert.equal(jobsShareMergeIdentity(
+    enriched,
+    { ...enriched, jobId: "name_other", securityId: "sid-2" }
+  ), false);
+  assert.equal(jobsShareMergeIdentity(
+    enriched,
+    { ...enriched, jobId: "name_other", lid: "lid-2" }
+  ), false);
+  assert.equal(jobsShareMergeIdentity(
+    enriched,
+    { ...enriched, jobId: "name_other", location: "深圳", securityId: "sid-2", lid: "lid-2" }
+  ), false);
+  const upgraded = mergeTaskResults(
+    [{ decision: "pass", job: { ...incomplete, securityId: "sid-1" } }],
+    [{ decision: "pass", job: { ...enriched, jobId: "real-1" } }]
+  );
+  assert.deepEqual(upgraded.results.map((row) => row.job.jobId), ["real-1"]);
+});
+
+test("target delivery counts only successful sends and stops at the target", () => {
+  const task = {
+    targetMode: true,
+    targetCount: 3,
+    counters: { success: 2, skipped: 4, failed: 1 }
+  };
+  assert.equal(countSuccessfulDeliveries(task), 2);
+  assert.equal(targetDeliveryRemaining(task), 1);
+  assert.equal(isTargetDeliveryReached(task), false);
+  task.counters.success = 3;
+  assert.equal(targetDeliveryRemaining(task), 0);
+  assert.equal(isTargetDeliveryReached(task), true);
+  task.counters.success = 9;
+  assert.equal(isTargetDeliveryReached(task), true);
+});
+
+test("operation registry returns and clears every active content operation", () => {
+  const registry = createOperationRegistry();
+  registry.add({ opId: "one", tabId: 1 });
+  registry.add({ opId: "two", tabId: 2 });
+  assert.equal(registry.size, 2);
+  assert.deepEqual(registry.list().map((row) => row.opId), ["one", "two"]);
+  const cancelled = registry.clear();
+  assert.equal(cancelled.length, 2);
+  assert.equal(registry.size, 0);
+});
+
+test("preview collection stops at its deadline and keeps a separate result grace", () => {
+  const now = 1_000_000;
+  const scanDeadline = now + OPERATION_TIMEOUTS.PREVIEW_SCROLL_MS;
+  const scanPageMs = resolvePageOperationTimeoutMs("BHT_SCAN_JOBS", { deadlineAt: scanDeadline }, now);
+  assert.equal(
+    scanPageMs,
+    OPERATION_TIMEOUTS.PREVIEW_SCROLL_MS + OPERATION_TIMEOUTS.PREVIEW_RESULT_GRACE_MS
+  );
+  assert.equal(
+    resolvePageOperationTimeoutMs("BHT_SCAN_JOBS", { deadlineAt: now + 250 }, now),
+    250 + OPERATION_TIMEOUTS.PREVIEW_RESULT_GRACE_MS
+  );
+  assert.equal(
+    resolveBridgeTimeoutMs(scanPageMs),
+    scanPageMs + OPERATION_TIMEOUTS.BRIDGE_GRACE_MS
+  );
+  assert.equal(
+    resolvePageOperationTimeoutMs("BHT_SCAN_JOBS", { deadlineAt: now - 1 }, now),
+    0
+  );
+  assert.equal(
+    resolvePageOperationTimeoutMs("BHT_WAIT_CHAT_EDITOR", { timeoutMs: 30000 }, now),
+    33000
+  );
+  assert.equal(resolvePageOperationTimeoutMs("BHT_RETURN_TO_LIST", {}, now), 30000);
+  assert.equal(OPERATION_TIMEOUTS.BRIDGE_CANCEL_SETTLE_MS, 3000);
+  assert.equal(OPERATION_TIMEOUTS.BRIDGE_CANCEL_POLL_MS, 100);
+  assert.equal(isScanResultWithinFinalizationWindow({ scanMeta: {} }, {
+    collectionDeadlineAt: now + 1000,
+    bridgeDeadlineAt: now + 4000,
+    storageCompletedAt: now + 900
+  }), true);
+  assert.equal(isScanResultWithinFinalizationWindow({
+    scanMeta: { collectionFinishedAt: now + 950, workCompletedAt: now + 1800 }
+  }, {
+    collectionDeadlineAt: now + 1000,
+    bridgeDeadlineAt: now + 4000,
+    storageCompletedAt: now + 2200
+  }), true);
+  assert.equal(isScanResultWithinFinalizationWindow({
+    scanMeta: { collectionFinishedAt: now + 1050, workCompletedAt: now + 1800 }
+  }, {
+    collectionDeadlineAt: now + 1000,
+    bridgeDeadlineAt: now + 4000,
+    storageCompletedAt: now + 2200
+  }), false);
+});
+
+test("operation dispatch gate observes cancellation before side effects start", async () => {
+  let row = { status: "pending" };
+  let settledReason = "";
+  let dispatchStarted = false;
+  const permit = await awaitOperationDispatchPermit({
+    isCancelled: () => false,
+    readOperationState: async () => row,
+    settleCancellation: async (reason) => { settledReason = reason; },
+    yieldTurn: async () => { row = { status: "cancelled", reason: "用户停止" }; }
+  });
+  if (permit.ok) dispatchStarted = true;
+  assert.equal(permit.ok, false);
+  assert.equal(permit.reason, "cancelled");
+  assert.equal(settledReason, "用户停止");
+  assert.equal(dispatchStarted, false);
+});
+
+test("preview scan stops only at bottom, deadline, or a real batch error", () => {
+  const scanning = resolvePreviewScanStop({ deadlineAt: 2000, now: 1000 });
+  assert.equal(scanning.reason, PREVIEW_SCAN_STOP.SCANNING);
+  assert.equal(scanning.done, false);
+  assert.equal(
+    resolvePreviewScanStop({ reachedEnd: true, deadlineAt: 2000, now: 1000 }).reason,
+    PREVIEW_SCAN_STOP.REACHED_END
+  );
+  assert.equal(
+    resolvePreviewScanStop({ timedOut: true, batchError: "late bridge result" }).reason,
+    PREVIEW_SCAN_STOP.TIMEOUT
+  );
+  assert.equal(
+    resolvePreviewScanStop({ reachedEnd: true, timedOut: true }).reason,
+    PREVIEW_SCAN_STOP.TIMEOUT,
+    "an expired deadline must never be reported as a confirmed list bottom"
+  );
+  assert.equal(
+    resolvePreviewScanStop({ reachedEnd: true, timedOut: false, deadlineAt: 1000, now: 1001 }).reason,
+    PREVIEW_SCAN_STOP.REACHED_END,
+    "a bottom confirmed before the deadline must survive later result processing"
+  );
+  assert.equal(
+    resolvePreviewScanStop({ batchError: "real failure", deadlineAt: 2000, now: 1000 }).reason,
+    PREVIEW_SCAN_STOP.BATCH_ERROR
+  );
+});
+
+test("older polling snapshots cannot overwrite a stopped task event", () => {
+  const stopped = { id: "task-1", revision: 8, updatedAt: 200, status: "stopped", createdAt: 100 };
+  const staleRunning = { id: "task-1", revision: 7, updatedAt: 190, status: "running", createdAt: 100 };
+  const restarted = { id: "task-1", revision: 9, updatedAt: 210, status: "running", createdAt: 100 };
+  assert.equal(shouldAcceptTaskSnapshot(stopped, staleRunning), false);
+  assert.equal(shouldAcceptTaskSnapshot(stopped, restarted), true);
+  assert.equal(shouldAcceptTaskSnapshot(staleRunning, stopped), true);
+  assert.equal(shouldAcceptTaskSnapshot(stopped, null, { authoritative: true }), true);
+  assert.equal(shouldAcceptTaskSnapshot(stopped, staleRunning, { authoritative: true }), true);
+});
+
+test("stop cancels page operations and protects the stopped terminal state", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const messaging = fs.readFileSync("extension/shared/messaging.js", "utf8");
+  const stop = background.slice(background.indexOf("case MSG.STOP_TASK"), background.indexOf("case MSG.SKIP_CURRENT"));
+  assert.ok(stop.includes("runner.abort = true"));
+  assert.ok(stop.includes("await cancelActiveOperations"));
+  assert.ok(background.includes("STOP 是不可逆终态"));
+  assert.ok(background.includes("row?.status === 'cancelled'"));
+  assert.ok(content.includes("operationCancelledError"));
+  assert.ok(content.includes("BHT_OP_CANCELLED"));
+  assert.ok(content.includes('status: "cancelled"'));
+  assert.ok(!content.includes("resumePendingOps"));
+  assert.ok(!background.includes("tabs.connect"));
+  assert.ok(!content.includes("runtime.onConnect"));
+  assert.ok(background.includes("clearStaleOperationArtifacts"));
+  assert.ok(messaging.includes("BHT_CANCEL_OP"));
+});
+
+test("legacy persistent worker-tab delivery path stays removed", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  assert.ok(!background.includes("function ensureWorkerTab"));
+  assert.ok(!background.includes("function openQueueJobOnWorker"));
+  assert.ok(background.includes("buildDeliveryQueue"));
+  assert.ok(background.includes("collectDoneJobIds"));
+});
+
+console.log("13) v1.7.19 environment failure auto-skip classification");
+test("env auto-continue classifies infrastructure errors only", () => {
+  const envErrors = [
+    "WORKER_PAGE_NOT_READY",
+    "WORKER_CHAT_CLICK_NO_EFFECT",
+    "WORKER_CHAT_BUTTON_NOT_FOUND",
+    "WORKER_TAB_FAILED",
+    "WORKER_TRIGGER_EXCEPTION",
+    "WORKER_TRIGGER_EMPTY",
+    "WORKER_TARGET_MISSING",
+    "TARGET_TAB_CLOSED",
+    "RUN_OP_NOT_SUPPORTED",
+    "CONTENT_INJECT_FAIL",
+    "OP_BRIDGE_TIMEOUT",
+    "OP_DEADLINE_EXCEEDED",
+    "NO_BOSS_TAB",
+    "NAVIGATED",
+    "WORKER_LEFT_DETAIL"
+  ];
+  for (const error of envErrors) {
+    assert.ok(ENV_AUTO_CONTINUE_ERRORS.has(error), 'env set must contain ' + error);
+    assert.equal(isEnvironmentalFailure({ ok: false, error }), true, error);
+  }
+  // 需要用户确认/真实业务失败仍走原暂停流程
+  assert.equal(isEnvironmentalFailure({ ok: false, error: "LOGIN_REQUIRED" }), false, "login still pauses");
+  assert.equal(isEnvironmentalFailure({ ok: false, error: "CONVERSATION_CREATE_NOT_CONFIRMED" }), false, "unconfirmed receipt still pauses");
+  assert.equal(isEnvironmentalFailure({ ok: false, error: "FILTER_ACTIVE" }), false, "filter skip is separate");
+  assert.equal(isEnvironmentalFailure({ ok: false, error: "SEND_NOT_CONFIRMED" }), false, "mid-send failure still pauses");
+});
+
+test("worker trigger retries only reopenable environment failures", () => {
+  assert.equal(WORKER_TRIGGER_RETRY.maxTries, 3);
+  assert.ok(WORKER_TRIGGER_RETRYABLE_ERRORS.has("WORKER_TAB_FAILED"));
+  assert.ok(WORKER_TRIGGER_RETRYABLE_ERRORS.has("WORKER_CHAT_BUTTON_NOT_FOUND"));
+  assert.ok(WORKER_TRIGGER_RETRYABLE_ERRORS.has("WORKER_PAGE_NOT_READY"));
+  assert.ok(!WORKER_TRIGGER_RETRYABLE_ERRORS.has("CONVERSATION_CREATE_NOT_CONFIRMED"));
+  assert.ok(!WORKER_TRIGGER_RETRYABLE_ERRORS.has("WORKER_CHAT_CLICK_NO_EFFECT"));
+  assert.ok(!WORKER_TRIGGER_RETRYABLE_ERRORS.has("OP_BRIDGE_TIMEOUT"));
+  assert.equal(isWorkerTriggerRetryable({ ok: false, error: "WORKER_TAB_FAILED" }), true);
+  assert.equal(isWorkerTriggerRetryable({ ok: false, error: "CONTENT_INJECT_FAIL" }), true);
+  assert.equal(isWorkerTriggerRetryable({ ok: false, error: "WORKER_CHAT_BUTTON_NOT_FOUND" }), true);
+  assert.equal(isWorkerTriggerRetryable({ ok: false, error: "WORKER_CHAT_CLICK_NO_EFFECT" }), false, "already clicked, do not click again");
+  assert.equal(isWorkerTriggerRetryable({ ok: false, error: "CONVERSATION_CREATE_NOT_CONFIRMED" }), false, "receipt missing is not re-clicked");
+  assert.equal(isWorkerTriggerRetryable({ ok: false, error: "OP_BRIDGE_TIMEOUT" }), false, "bridge timeout may be after click");
+  assert.equal(isWorkerTriggerRetryable({ ok: true, error: "WORKER_TAB_FAILED" }), false, "success is not retried");
+  assert.equal(isWorkerTriggerRetryable({ ok: false, filtered: true, error: "FILTER_ACTIVE" }), false);
+  assert.equal(isWorkerTriggerRetryable({ ok: false, error: "LOGIN_REQUIRED" }), false);
+  assert.equal(isWorkerTriggerRetryable({ ok: false, error: "OP_CANCELLED" }), false);
+  assert.equal(isWorkerTriggerRetryable({ ok: false, error: "NAVIGATED" }), false, "already navigated chat is not re-clicked");
+  assert.equal(isWorkerTriggerRetryable({ ok: false, error: "WORKER_LEFT_DETAIL" }), false, "already left detail is not re-clicked");
+  assert.equal(canFallbackWorkerMode({ ok: false, error: "WORKER_TAB_FAILED" }), true);
+  assert.equal(canFallbackWorkerMode({ ok: false, error: "WORKER_CHAT_BUTTON_NOT_FOUND" }), true);
+  assert.equal(canFallbackWorkerMode({ ok: false, error: "WORKER_LEFT_DETAIL" }), false, "left-detail does not list-fallback");
+  assert.equal(canFallbackWorkerMode({ ok: false, error: "CONVERSATION_CREATE_NOT_CONFIRMED" }), false);
+  assert.equal(canFallbackWorkerMode({ ok: false, error: "NAVIGATED" }), false);
+  assert.equal(isEnvironmentalFailure({ ok: false, error: "WORKER_LEFT_DETAIL" }), true);
+  assert.equal(isEnvironmentalFailure({ ok: false, error: "DETAIL_IDENTITY_MISMATCH" }), false, "identity mismatch still pauses");
+  assert.equal(isEnvironmentalFailure({ ok: false, error: "NAVIGATED" }), true, "temp page navigation interrupt is env");
+  assert.equal(isEnvironmentalFailure({ ok: false, error: "IMAGE_SEND_NOT_CONFIRMED" }), false, "image confirm miss is stamped via envAutoSkip flag path");
+  assert.equal(isEnvironmentalFailure({ ok: true, error: "" }), false, "success is never env");
+  assert.equal(isEnvironmentalFailure(null), false);
+  assert.equal(isEnvironmentalFailure(undefined), false);
+  assert.equal(isEnvironmentalFailure({ ok: false }), false, "missing error key is not env");
+});
+
+console.log("14) v1.7.19 debug log never blocks the runner");
+test("debug log append is non-blocking and bursts coalesce into one flush", async () => {
+  let setCalls = 0;
+  const store = new Map();
+  globalThis.chrome = globalThis.chrome || {};
+  globalThis.chrome.storage = globalThis.chrome.storage || {};
+  globalThis.chrome.storage.session = {
+    get: async (key) => ({ [key]: store.get(key) }),
+    set: async (obj) => {
+      for (const [k, v] of Object.entries(obj)) store.set(k, v);
+      setCalls += 1;
+    }
+  };
+  const t0 = Date.now();
+  for (let i = 0; i < 300; i++) {
+    await appendSessionDebugLog({ ts: i, level: "debug", scope: "test", event: "bulk_" + i, data: { n: i } });
+  }
+  const appendMs = Date.now() - t0;
+  assert.ok(appendMs < 700, "appends must not wait for storage flush, took " + appendMs + "ms");
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  const bag = await getSessionDebugLogs();
+  assert.equal(bag.length, 300, "all entries persisted");
+  assert.ok(setCalls <= 2, "burst coalesced into few flushes, got " + setCalls);
+  assert.equal(bag[bag.length - 1].event, "bulk_299", "newest entry survives");
+});
+
+test("debug log trims to budget keeping newest entries", async () => {
+  for (let i = 0; i < 6000; i++) {
+    await appendSessionDebugLog({ ts: 100000 + i, level: "debug", scope: "test", event: "trim_" + i });
+  }
+  const trimmed = await getSessionDebugLogs();
+  assert.ok(trimmed.length <= 5000, "trimmed to max entries, got " + trimmed.length);
+  assert.equal(trimmed[trimmed.length - 1].event, "trim_5999", "newest kept after trim");
+  assert.ok(!trimmed.some((entry) => entry.event === "bulk_0"), "oldest dropped after trim");
+});
+
+test("debug log never blocks a caller even while a flush is in flight", async () => {
+  const t0 = Date.now();
+  await Promise.all([
+    appendSessionDebugLog({ ts: 1, event: "inflight_a" }),
+    appendSessionDebugLog({ ts: 2, event: "inflight_b" }),
+    appendSessionDebugLog({ ts: 3, event: "inflight_c" })
+  ]);
+  const elapsedMs = Date.now() - t0;
+  assert.ok(elapsedMs < 300, "concurrent appends must not serialize on storage, took " + elapsedMs + "ms");
+});
+
+test("non-chat apply label recognition covers 央国企网申按钮", () => {
+  assert.equal(isNonChatApplyLabel("立即网申"), true);
+  assert.equal(isNonChatApplyLabel("立即投递"), true);
+  assert.equal(isNonChatApplyLabel("投递简历"), true);
+  assert.equal(isNonChatApplyLabel("立即申请"), true);
+  assert.equal(isNonChatApplyLabel("申请职位"), true);
+  assert.equal(isNonChatApplyLabel("网申"), true);
+  // 不允许误伤沟通类按钮与无关文本
+  assert.equal(isNonChatApplyLabel("立即沟通"), false);
+  assert.equal(isNonChatApplyLabel("继续沟通"), false);
+  assert.equal(isNonChatApplyLabel("打招呼"), false);
+  assert.equal(isNonChatApplyLabel("查看职位"), false);
+  assert.equal(isNonChatApplyLabel(""), false);
+  // 标签列表齐全
+  for (const label of NON_CHAT_APPLY_LABELS) {
+    assert.equal(isNonChatApplyLabel(label), true, label + " must be in its own list");
+  }
+});
+
+
+await runRegisteredTests();
+
+if (process.exitCode) {
+  console.error("\nSome tests failed");
+  process.exit(1);
+}
+console.log(`\nAll ${passed} unit tests passed.`);

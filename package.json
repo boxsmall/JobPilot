@@ -1,0 +1,24 @@
+{
+  "name": "jobpilot",
+  "version": "1.7.45",
+  "private": true,
+  "type": "module",
+  "description": "职航 JobPilot：AI 求职与投递助手",
+  "scripts": {
+    "test": "node scripts/unit-tests.mjs && node scripts/flow-tests.mjs && node scripts/background-delivery-tests.mjs && node scripts/audit-regression-tests.mjs && node scripts/update-reminder-tests.mjs",
+    "test:flow": "node scripts/flow-tests.mjs",
+    "test:panel:serve": "node scripts/panel-harness-server.mjs",
+    "smoke": "node scripts/smoke-test.mjs",
+    "release:check": "node scripts/sync-release-notes.mjs",
+    "release:sync": "node scripts/sync-release-notes.mjs --apply",
+    "test:career": "node scripts/career-tests.mjs",
+    "test:career:browser": "node scripts/career-browser-tests.mjs",
+    "vendor:career": "node scripts/vendor-career.mjs",
+    "check": "node scripts/unit-tests.mjs && node scripts/flow-tests.mjs && node scripts/background-delivery-tests.mjs && node scripts/audit-regression-tests.mjs && node scripts/update-reminder-tests.mjs && node scripts/smoke-test.mjs && node scripts/career-tests.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.65.0",
+    "mammoth": "^1.13.0",
+    "pdfjs-dist": "^6.5.438"
+  }
+}

@@ -1,0 +1,481 @@
+(() => {
+  const BHT_FLOAT_HOST_VERSION = "1.7.45";
+  if (window.__BHT_FLOAT_HOST_VERSION__ === BHT_FLOAT_HOST_VERSION && window.__BHT_FLOAT_HOST__) return;
+  window.__BHT_FLOAT_HOST_VERSION__ = BHT_FLOAT_HOST_VERSION;
+  window.__BHT_FLOAT_HOST__ = true;
+
+  const ROOT_ID = "bht-float-root";
+  const STORAGE_POS = "bht_float_pos_v1";
+  const STORAGE_OPEN = "bht_float_open_v1";
+  const STORAGE_FAB = "bht_float_fab_v1";
+  const VIEWPORT_MARGIN = 8;
+
+  function isMessagePage(url = window.location?.href || "") {
+    return /\/chat(?:[/?#]|$)/i.test(String(url));
+  }
+
+  function loadCss() {
+    if (document.getElementById("bht-float-css")) return;
+    const link = document.createElement("link");
+    link.id = "bht-float-css";
+    link.rel = "stylesheet";
+    link.href = chrome.runtime.getURL("content/floating-host.css");
+    (document.head || document.documentElement).appendChild(link);
+  }
+
+  function clamp(n, min, max) {
+    return Math.max(min, Math.min(max, n));
+  }
+
+  function fitRectToViewport(rect = {}, viewport = {}, margin = VIEWPORT_MARGIN) {
+    const viewportWidth = Math.max(0, Number(viewport.width) || 0);
+    const viewportHeight = Math.max(0, Number(viewport.height) || 0);
+    const width = Math.max(0, Number(rect.width) || 0);
+    const height = Math.max(0, Number(rect.height) || 0);
+    const safeMargin = Math.max(0, Number(margin) || 0);
+    const minLeft = Math.min(safeMargin, Math.max(0, viewportWidth - width));
+    const minTop = Math.min(safeMargin, Math.max(0, viewportHeight - height));
+    const maxLeft = Math.max(minLeft, viewportWidth - width - safeMargin);
+    const maxTop = Math.max(minTop, viewportHeight - height - safeMargin);
+    return {
+      left: clamp(Number(rect.left) || 0, minLeft, maxLeft),
+      top: clamp(Number(rect.top) || 0, minTop, maxTop)
+    };
+  }
+
+  window.__BHT_FLOAT_LAYOUT__ = Object.freeze({ fitRectToViewport, isMessagePage });
+
+  function fitElementToViewport(element, margin = VIEWPORT_MARGIN) {
+    if (!element) return null;
+    const rect = element.getBoundingClientRect();
+    const next = fitRectToViewport(rect, {
+      width: window.innerWidth,
+      height: window.innerHeight
+    }, margin);
+    element.style.left = next.left + "px";
+    element.style.top = next.top + "px";
+    element.style.right = "auto";
+    element.style.bottom = "auto";
+    return next;
+  }
+
+  function getRoot() {
+    let root = document.getElementById(ROOT_ID);
+    if (root) return root;
+    root = document.createElement("div");
+    root.id = ROOT_ID;
+    root.innerHTML = `
+      <button type="button" class="bht-fab" id="bht-fab" title="职航 JobPilot" aria-label="打开 职航 JobPilot">
+        <img src="${chrome.runtime.getURL("assets/icons/icon128.png")}" alt="" />
+      </button>
+      <div class="bht-panel" id="bht-panel" hidden>
+        <div class="bht-panel-header" id="bht-drag">
+          <div class="bht-panel-title">
+            <img src="${chrome.runtime.getURL("assets/icons/icon48.png")}" alt="" />
+            <span>职航 JobPilot</span>
+          </div>
+          <div class="bht-panel-actions">
+            <button type="button" class="bht-icon-btn" id="bht-min" title="收起">—</button>
+            <button type="button" class="bht-icon-btn" id="bht-close" title="关闭">×</button>
+          </div>
+        </div>
+        <iframe class="bht-frame" id="bht-frame" title="职航 JobPilot面板"></iframe>
+      </div>
+    `;
+    document.documentElement.appendChild(root);
+    return root;
+  }
+
+  function savePos(panel) {
+    const rect = panel.getBoundingClientRect();
+    const data = { left: rect.left, top: rect.top };
+    try {
+      localStorage.setItem(STORAGE_POS, JSON.stringify(data));
+    } catch (_) {}
+  }
+
+  function restorePos(panel) {
+    try {
+      const raw = localStorage.getItem(STORAGE_POS);
+      if (!raw) return;
+      const pos = JSON.parse(raw);
+      if (typeof pos.left === "number" && typeof pos.top === "number") {
+        const rect = panel.getBoundingClientRect();
+        const next = fitRectToViewport({
+          left: pos.left,
+          top: pos.top,
+          width: rect.width,
+          height: rect.height
+        }, {
+          width: window.innerWidth,
+          height: window.innerHeight
+        });
+        panel.style.left = next.left + "px";
+        panel.style.top = next.top + "px";
+        panel.style.right = "auto";
+        panel.style.bottom = "auto";
+      }
+    } catch (_) {}
+  }
+
+  function setOpen(open) {
+    const panel = document.getElementById("bht-panel");
+    const fab = document.getElementById("bht-fab");
+    if (!panel || !fab) return;
+    panel.hidden = !open;
+    fab.classList.toggle("is-hidden", open);
+    const frame = document.getElementById("bht-frame");
+    if (open) {
+      if (frame) {
+        // FORCE_IFRAME_RELOAD: 每次打开都带版本号，避免浮窗卡在旧 UI
+        const next = chrome.runtime.getURL("sidepanel/index.html?mode=float&v=" + BHT_FLOAT_HOST_VERSION);
+        if (!frame.src || !frame.src.includes("v=" + BHT_FLOAT_HOST_VERSION)) {
+          frame.src = next;
+        }
+        try { frame.contentWindow?.postMessage({ source: "bht-host", cmd: "resume" }, "*"); } catch (_) {}
+      }
+      restorePos(panel);
+    } else if (frame) {
+      try { frame.contentWindow?.postMessage({ source: "bht-host", cmd: "suspend" }, "*"); } catch (_) {}
+    }
+    try {
+      sessionStorage.setItem(STORAGE_OPEN, open ? "1" : "0");
+    } catch (_) {}
+  }
+
+  function setFabVisible(visible) {
+    const fab = document.getElementById("bht-fab");
+    if (!fab) return;
+    fab.style.display = visible ? "" : "none";
+    try {
+      localStorage.setItem(STORAGE_FAB, visible ? "1" : "0");
+    } catch (_) {}
+  }
+
+  
+  function enableFabDrag(fab) {
+    let dragging = false;
+    let moved = false;
+    let startX = 0, startY = 0, origL = 0, origT = 0;
+    const STORE = "bht_fab_pos_v1";
+
+    try {
+      const raw = localStorage.getItem(STORE);
+      if (raw) {
+        const pos = JSON.parse(raw);
+        if (typeof pos.left === "number" && typeof pos.top === "number") {
+          const rect = fab.getBoundingClientRect();
+          const next = fitRectToViewport({
+            left: pos.left,
+            top: pos.top,
+            width: rect.width,
+            height: rect.height
+          }, {
+            width: window.innerWidth,
+            height: window.innerHeight
+          }, 0);
+          fab.style.left = next.left + "px";
+          fab.style.top = next.top + "px";
+          fab.style.right = "auto";
+          fab.style.bottom = "auto";
+        }
+      }
+    } catch (_) {}
+
+    const onDown = (e) => {
+      dragging = true;
+      moved = false;
+      const point = e.touches ? e.touches[0] : e;
+      startX = point.clientX;
+      startY = point.clientY;
+      const rect = fab.getBoundingClientRect();
+      origL = rect.left;
+      origT = rect.top;
+      fab.style.left = origL + "px";
+      fab.style.top = origT + "px";
+      fab.style.right = "auto";
+      fab.style.bottom = "auto";
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+      document.addEventListener("touchmove", onMove, { passive: false });
+      document.addEventListener("touchend", onUp);
+    };
+    const onMove = (e) => {
+      if (!dragging) return;
+      const point = e.touches ? e.touches[0] : e;
+      const dx = point.clientX - startX;
+      const dy = point.clientY - startY;
+      if (Math.abs(dx) + Math.abs(dy) > 4) moved = true;
+      if (e.cancelable && moved) e.preventDefault();
+      const rect = fab.getBoundingClientRect();
+      const next = fitRectToViewport({
+        left: origL + dx,
+        top: origT + dy,
+        width: rect.width,
+        height: rect.height
+      }, {
+        width: window.innerWidth,
+        height: window.innerHeight
+      }, 0);
+      fab.style.left = next.left + "px";
+      fab.style.top = next.top + "px";
+    };
+    const onUp = () => {
+      if (!dragging) return;
+      dragging = false;
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.removeEventListener("touchmove", onMove);
+      document.removeEventListener("touchend", onUp);
+      const rect = fab.getBoundingClientRect();
+      try {
+        localStorage.setItem(STORE, JSON.stringify({ left: rect.left, top: rect.top }));
+      } catch (_) {}
+      // 若发生拖动，阻止紧随其后的 click 打开面板
+      if (moved) {
+        fab.dataset.skipClick = "1";
+        setTimeout(() => {
+          delete fab.dataset.skipClick;
+        }, 80);
+      }
+    };
+    fab.addEventListener("mousedown", onDown);
+    fab.addEventListener("touchstart", onDown, { passive: true });
+  }
+
+  function enableDrag(panel, handle) {
+    let dragging = false;
+    let startX = 0;
+    let startY = 0;
+    let origL = 0;
+    let origT = 0;
+
+    const onDown = (e) => {
+      if (e.target.closest("button")) return;
+      dragging = true;
+      const point = e.touches ? e.touches[0] : e;
+      startX = point.clientX;
+      startY = point.clientY;
+      const rect = panel.getBoundingClientRect();
+      origL = rect.left;
+      origT = rect.top;
+      panel.style.left = origL + "px";
+      panel.style.top = origT + "px";
+      panel.style.right = "auto";
+      panel.style.bottom = "auto";
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+      document.addEventListener("touchmove", onMove, { passive: false });
+      document.addEventListener("touchend", onUp);
+    };
+
+    const onMove = (e) => {
+      if (!dragging) return;
+      if (e.cancelable) e.preventDefault();
+      const point = e.touches ? e.touches[0] : e;
+      const dx = point.clientX - startX;
+      const dy = point.clientY - startY;
+      const w = panel.offsetWidth;
+      const h = panel.offsetHeight;
+      const next = fitRectToViewport({
+        left: origL + dx,
+        top: origT + dy,
+        width: w,
+        height: h
+      }, {
+        width: window.innerWidth,
+        height: window.innerHeight
+      });
+      panel.style.left = next.left + "px";
+      panel.style.top = next.top + "px";
+    };
+
+    const onUp = () => {
+      if (!dragging) return;
+      dragging = false;
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.removeEventListener("touchmove", onMove);
+      document.removeEventListener("touchend", onUp);
+      savePos(panel);
+    };
+
+    handle.addEventListener("mousedown", onDown);
+    handle.addEventListener("touchstart", onDown, { passive: true });
+  }
+
+  function enableViewportFit(root, panel, fab) {
+    if (!root || root.dataset.viewportFitBound === "1") return;
+    root.dataset.viewportFitBound = "1";
+    let frame = 0;
+    const schedule = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        if (panel && !panel.hidden) fitElementToViewport(panel);
+        if (fab && getComputedStyle(fab).display !== "none") fitElementToViewport(fab, 0);
+      });
+    };
+    window.addEventListener("resize", schedule);
+    window.visualViewport?.addEventListener("resize", schedule);
+  }
+
+  function init() {
+    if (isMessagePage()) return false;
+    loadCss();
+    const root = getRoot();
+    root.hidden = false;
+    root.style.display = "";
+    const fab = root.querySelector("#bht-fab");
+    const panel = root.querySelector("#bht-panel");
+    const drag = root.querySelector("#bht-drag");
+    const btnMin = root.querySelector("#bht-min");
+    const btnClose = root.querySelector("#bht-close");
+
+    enableFabDrag(fab);
+    fab.addEventListener("click", (e) => {
+      if (fab.dataset.skipClick === "1") {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      setOpen(true);
+    });
+    btnMin.addEventListener("click", () => setOpen(false));
+    btnClose.addEventListener("click", () => setOpen(false));
+    enableDrag(panel, drag);
+    enableViewportFit(root, panel, fab);
+
+    let fabVisible = true;
+    try {
+      fabVisible = localStorage.getItem(STORAGE_FAB) !== "0";
+    } catch (_) {}
+    setFabVisible(fabVisible);
+
+    let shouldOpen = false;
+    try {
+      // 面板开关只属于当前标签页，避免一个页面打开后所有 BOSS 标签都加载面板并轮询。
+      shouldOpen = sessionStorage.getItem(STORAGE_OPEN) === "1";
+      localStorage.removeItem(STORAGE_OPEN);
+    } catch (_) {}
+    if (shouldOpen) setOpen(true);
+    return true;
+  }
+
+  function syncHostForPage() {
+    const root = document.getElementById(ROOT_ID);
+    if (isMessagePage()) {
+      if (root) {
+        root.hidden = true;
+        root.style.display = "none";
+      }
+      return;
+    }
+    if (root) {
+      root.hidden = false;
+      root.style.display = "";
+      return;
+    }
+    init();
+  }
+
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    const type = msg?.type;
+    if (type === "BHT_FLOAT_OPEN") {
+      if (!init()) {
+        sendResponse({ ok: false, hiddenOnMessagePage: true });
+        return true;
+      }
+      setFabVisible(true);
+      setOpen(true);
+      sendResponse({ ok: true });
+      return true;
+    }
+    if (type === "BHT_FLOAT_CLOSE") {
+      setOpen(false);
+      sendResponse({ ok: true });
+      return true;
+    }
+    if (type === "BHT_FLOAT_TOGGLE_FAB") {
+      if (!init()) {
+        sendResponse({ ok: false, hiddenOnMessagePage: true });
+        return true;
+      }
+      const fab = document.getElementById("bht-fab");
+      // if currently shown, hide; if hidden, show
+      const nowHidden = fab?.style.display === "none";
+      setFabVisible(nowHidden ? true : false);
+      if (!nowHidden) setOpen(false);
+      sendResponse({ ok: true, fabVisible: nowHidden });
+      return true;
+    }
+    if (type === "BHT_FLOAT_PING") {
+      sendResponse({ ok: true, ready: !isMessagePage(), hiddenOnMessagePage: isMessagePage() });
+      return true;
+    }
+    return false;
+  });
+
+  // auto mount FAB on BOSS pages
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init, { once: true });
+  } else {
+    init();
+  }
+
+  let lastPageUrl = window.location?.href || "";
+  setInterval(() => {
+    const nextPageUrl = window.location?.href || "";
+    if (nextPageUrl === lastPageUrl) return;
+    lastPageUrl = nextPageUrl;
+    syncHostForPage();
+  }, 500);
+
+  function markContextDead(reason) {
+    try {
+      let tip = document.getElementById("bht-context-dead");
+      if (!tip) {
+        tip = document.createElement("div");
+        tip.id = "bht-context-dead";
+        tip.style.cssText = "position:fixed;right:16px;bottom:86px;z-index:2147483647;max-width:260px;background:#7f1d1d;color:#fff;padding:10px 12px;border-radius:10px;font:12px/1.45 sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.25)";
+        tip.innerHTML = "<b>海投助手需刷新</b><div style=\"margin-top:4px\">扩展已重载，当前页面脚本失效。请 F5 刷新本页后再使用。</div>";
+        document.documentElement.appendChild(tip);
+      }
+      const fab = document.getElementById("bht-fab");
+      if (fab) fab.title = "请先 F5 刷新页面";
+      console.warn("[BHT float] context dead:", reason || "");
+    } catch (_) {}
+  }
+
+  function probeRuntime() {
+    try {
+      if (!chrome?.runtime?.id) {
+        markContextDead("no runtime id");
+        return;
+      }
+      chrome.runtime.sendMessage({ type: "BHT_PING", payload: {} }, () => {
+        const err = chrome.runtime.lastError?.message || "";
+        if (/invalidated|Receiving end does not exist|message port closed/i.test(err)) {
+          // Receiving end 可能只是 SW 休眠，不一律当失效
+          if (/invalidated/i.test(err)) markContextDead(err);
+          return;
+        }
+        // 自愈：面板打开状态因页面重载/宿主重建而丢时（分屏搬移窗口等），探测到运行时可用后自动恢复
+        try {
+          if (sessionStorage.getItem(STORAGE_OPEN) === "1") {
+            const panel = document.getElementById("bht-panel");
+            if (panel && panel.hidden) setOpen(true);
+          }
+        } catch (_) {}
+      });
+    } catch (e) {
+      markContextDead(String(e?.message || e));
+    }
+  }
+
+  setInterval(probeRuntime, 20000);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") probeRuntime();
+  });
+  setTimeout(probeRuntime, 3000);
+
+})();

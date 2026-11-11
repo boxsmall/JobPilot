@@ -1,0 +1,21 @@
+#tabs { grid-template-columns: repeat(7, minmax(0, 1fr)); }
+#tabs button { padding-left: 3px; padding-right: 3px; }
+#tab-career { padding-bottom: 72px; }
+#tab-career label:not(.check) { display: block; margin: 12px 0 5px; color: var(--muted); }
+#tab-career input:not([type=checkbox]), #tab-career textarea { width: 100%; }
+#tab-career input[type=file] { font-size: 12px; }
+#tab-career .check { margin: 12px 0; align-items: flex-start; }
+#tab-career .btn-row { flex-wrap: wrap; margin-top: 12px; }
+#tab-career details { margin-top: 16px; }
+#tab-career summary { cursor: pointer; font-weight: 600; padding: 8px 0; }
+.career-hero { border-top: 3px solid var(--primary); }
+.career-eyebrow { color: var(--primary); font-size: 10px; letter-spacing: 1.3px; }
+.career-hero h2 { margin: 12px 0 8px; font-size: 20px; line-height: 1.4; }
+.career-status { white-space: pre-wrap; padding: 10px; border-radius: 6px; background: var(--primary-soft); margin-bottom: 0; overflow-wrap: anywhere; }
+.career-save { position: sticky; bottom: 0; padding: 12px 0; background: var(--bg); z-index: 2; }
+.career-save button { width: 100%; }
+#careerScoreProgress { width: 100%; height: 6px; accent-color: var(--primary); margin-top: 16px; }
+.career-inbox-item { border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin-top: 10px; overflow-wrap: anywhere; }
+.career-subtitle { margin-top: 20px; }
+.career-report { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; line-height: 1.8; max-height: 560px; overflow: auto; }
+.career-score-line { color: var(--primary); padding-top: 8px; font-size: 12px; line-height: 1.6; }
